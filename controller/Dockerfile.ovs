@@ -1,0 +1,27 @@
+# Dockerfile xây dựng Docker OVS Switch nhúng NFV Proxy
+# docker build -t dcn-ovs:latest -f Dockerfile.ovs .
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y \
+    openvswitch-switch \
+    openvswitch-common \
+    iproute2 \
+    net-tools \
+    iputils-ping \
+    tcpdump \
+    iptables \
+    iperf3 \
+    ethtool \
+    python3 \
+    python3-pip \
+    python3-scapy \
+    curl \
+    procps \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY entrypoint_ovs.sh /entrypoint_ovs.sh
+RUN chmod +x /entrypoint_ovs.sh
+
+ENTRYPOINT ["/entrypoint_ovs.sh"]

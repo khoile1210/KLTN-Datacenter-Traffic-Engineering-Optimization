@@ -89,53 +89,56 @@ pip3 install psutil requests pandas networkx
 pip3 install numpy pandas matplotlib seaborn
 ```
 
-### Run
+### Build Docker Images
 
+```bash
+# 1. Build image Docker Host (dcn-host:latest)
+docker build -t dcn-host:latest -f Dockerfile .
+
+# 2. Build image Docker OVS Switch nhúng NFV Proxy (dcn-ovs:latest)
+docker build -t dcn-ovs:latest -f Dockerfile.ovs .
 ```
 
-#Terminal 1: Run Controller
+### Run
+
+```bash
+# Terminal 1: Run Controller (Ryu OF1.3)
 ryu-manager --observe-links controller.py ryu.app.ofctl_rest ryu.app.rest_topology --ofp-tcp-listen-port 6653
 
-#Terminal 2: Run Topology
+# Terminal 2: Run Topology Spine-Leaf
 sudo python3 spine_leaf_topo.py
 
 (containernet>) pingall
 
-- Xử lý khi bị treo Terminal: Ctrl + \
-    kill -9 %1
-    # 1. Tiêu diệt toàn bộ tiến trình Mininet, Ryu và Python đang kẹt
-    sudo killall -9 containernet mn ryu-manager python3
-
-    # 2. Xóa sạch các Docker Container do Containernet khởi tạo
-    docker rm -f $(docker ps -a -q --filter "name=mn.") 2>/dev/null
-
-    # 3. Dọn dẹp card mạng ảo (veth pairs) và cấu hình Open vSwitch còn sót lại
-    sudo mn -c
-
-    # 4. Đặt lại trạng thái bình thường cho terminal (nếu chữ gõ ra bị ẩn/lỗi)
-    stty sane
-    reset
-
-#Terminal 3: Run Management Plane
+# Terminal 3: Run Management Plane (Thu thập 10 Features + Full Hop-by-Hop Paths)
 python3 management_plane.py
 
-#Terminal 4: Traffic Generating
-sudo python3 traffic_generator_dynamic.py
+# Terminal 4: Sinh tải luồng Voi và Chuột liên tục (Đa kênh iperf3)
+sudo python3 traffic_generator.py
+
+# Terminal 5: Phân tích kết quả sau khi thu thập
+python3 analyze_csv_result.py
 ```
 
-### Cleaning:
+### Xử lý khi bị treo Terminal / Dọn dẹp:
 
-```
-sudo mn -c
+```bash
+# 1. Tiêu diệt toàn bộ tiến trình Mininet, Ryu, iperf3 và Python
+sudo killall -9 containernet mn ryu-manager python3 iperf3 2>/dev/null
+
+# 2. Xóa sạch các Docker Container do Mininet/Containernet khởi tạo
 docker rm -f $(docker ps -a -q --filter "name=mn.") 2>/dev/null
-sudo killall iperf3
 
-rm -f traffic_flow_dataset_with_paths.csv system_and_network_health.csv
+# 3. Dọn dẹp card mạng ảo (veth pairs) và cấu hình OVS còn sót lại
+sudo mn -c
+
+# 4. Đặt lại trạng thái terminal nếu bị lỗi phông/ẩn chữ
+stty sane && reset
 ```
 
 ### Collect CSV
 
+```powershell
+scp -i '.\sshkey.pem' ubuntu@35.187.226.188:/home/ubuntu/dcn/controller/results/*.csv .\controller\results\
 ```
-scp -i '.\sshkey,pem' ubuntu@35.187.226.188:/home/ubuntu/dcn/controller/traffic_flow_dataset_with_paths.csv .\controller\
-scp -i '.\sshkey,pem' ubuntu@35.187.226.188:/home/ubuntu/dcn/controller/system_and_network_health.csv .\controller\
-```
+

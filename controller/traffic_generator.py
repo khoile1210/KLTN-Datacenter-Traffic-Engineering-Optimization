@@ -2,11 +2,10 @@
 """
 Tên file: traffic_generator.py
 Mô tả   : Sinh tải mạng liên tục trên môi trường DOCKER CONTAINER (Containernet):
-          - Chạy vòng lặp vô hạn cho tới khi bấm Ctrl + C.
-          - Tự động bắt đúng dải IP DCN Spine-Leaf (10.0.0.0/24 trên card hX-eth0).
-          - Khởi động iperf3 server lắng nghe đúng IP DCN.
-          - Sinh đan xen 80% luồng Chuột (Mice - ping) và 20% luồng Voi (Elephant - iperf3).
-          - Tự động dọn dẹp tiến trình con khi dừng chương trình.
+          - Hỗ trợ đa cổng iperf3 (5201, 5202, 5203, 5204) trên mỗi host để giải quyết triệt để lỗi "server busy".
+          - Sinh đan xen 80% luồng Chuột (Mice - kết hợp cả TCP ngắn 20-50KB và Ping) và 20% luồng Voi (Elephant - iperf3 tải nặng).
+          - Luồng Chuột TCP ngắn tạo ra đúng đặc trưng 2 chiều (sbytes/dbytes, Ratio) cho mô hình học máy.
+          - Quản lý tiến trình an toàn, tự động dọn dẹp khi bấm Ctrl + C.
 """
 
 import subprocess
@@ -22,8 +21,8 @@ import signal
 ELEPHANT_FLOW_RATIO = 0.20   # 20% luồng Voi, 80% luồng Chuột
 MIN_DELAY_BETWEEN_FLOWS = 0.2
 MAX_DELAY_BETWEEN_FLOWS = 0.8
+IPERF_PORTS = [5201, 5202, 5203, 5204]  # Đa cổng để tránh nghẽn server busy
 
-# Biến cờ kiểm soát vòng lặp chính
 RUNNING = True
 
 
@@ -34,12 +33,11 @@ def handle_sigint(sig, frame):
     RUNNING = False
 
 
-# Đăng ký bắt tín hiệu ngắt bàn phím
 signal.signal(signal.SIGINT, handle_sigint)
 
 
 def discover_docker_hosts():
-    """Chỉ quét và lấy địa chỉ IP thuộc mạng DCN (10.0.0.x)."""
+    """Quét và lấy địa chỉ IP thuộc mạng DCN (10.0.0.x)."""
     print("[*] Đang quét các Docker container của mạng DCN Spine-Leaf...")
     try:
         docker_ps = subprocess.check_output(
@@ -55,7 +53,6 @@ def discover_docker_hosts():
         if c_name.startswith("mn."):
             short_name = c_name.replace("mn.", "")
             try:
-                # Quét tất cả IP và CHỈ chọn IP thuộc dải 10.0.0.x
                 ip_out = subprocess.check_output(
                     f"docker exec {c_name} ip -4 -o addr show",
                     shell=True
@@ -85,13 +82,14 @@ def exec_in_container(container_name, command, is_background=True):
 
 
 def start_iperf_servers(host_dict):
-    """Khởi động iperf3 server lắng nghe đúng IP DCN trên toàn bộ container."""
-    print("[*] Đang khởi động iperf3 server (-D) trên dải 10.0.0.x...")
+    """Khởi động iperf3 server trên nhiều cổng lắng nghe song song (5201-5204)."""
+    print(f"[*] Khởi động iperf3 server đa cổng {IPERF_PORTS} trên toàn bộ container...")
     for h_name, h_info in host_dict.items():
-        # Dọn sạch iperf cũ nếu có trước khi bật mới
         exec_in_container(h_info["container_name"], "killall -9 iperf3 2>/dev/null", is_background=False)
-        exec_in_container(h_info["container_name"], f"iperf3 -s -B {h_info['ip']} -D")
+        for p in IPERF_PORTS:
+            exec_in_container(h_info["container_name"], f"iperf3 -s -p {p} -B {h_info['ip']} -D")
     time.sleep(2)
+    print("[+] Toàn bộ iperf3 servers đa cổng đã sẵn sàng.")
 
 
 def cleanup_traffic_processes(host_dict):
@@ -103,16 +101,28 @@ def cleanup_traffic_processes(host_dict):
 
 
 def send_mice_flow(src_container, src_ip, dst_ip):
-    """Luồng Chuột (Mice): Ping kích thước nhỏ qua interface DCN."""
-    pkt_bytes = random.randint(64, 256)
-    exec_in_container(src_container, f"ping -c 4 -s {pkt_bytes} -i 0.2 {dst_ip}")
+    """
+    Luồng Chuột (Mice Flow):
+    Đan xen 50% Ping nhỏ (ICMP) và 50% luồng TCP dung lượng nhỏ (10KB - 50KB) qua iperf3 -n
+    để sinh ra đầy đủ đặc trưng 2 chiều (sbytes/dbytes, Ratio).
+    """
+    port = random.choice(IPERF_PORTS)
+    if random.random() < 0.5:
+        # Gói tin ICMP nhỏ
+        pkt_bytes = random.randint(64, 256)
+        exec_in_container(src_container, f"ping -c 3 -s {pkt_bytes} -i 0.2 {dst_ip}")
+    else:
+        # Phiên TCP truyền ngắn 20K - 50K kết thúc ngay
+        burst_size = random.choice(["20K", "30K", "50K"])
+        exec_in_container(src_container, f"iperf3 -c {dst_ip} -p {port} -B {src_ip} -n {burst_size}")
 
 
 def send_elephant_flow(src_container, src_ip, dst_ip):
-    """Luồng Voi (Elephant): iperf3 TCP duy trì tải lớn từ 5 -> 10 giây."""
+    """Luồng Voi (Elephant Flow): iperf3 TCP duy trì băng thông lớn (15M-50M) từ 5 -> 10 giây."""
+    port = random.choice(IPERF_PORTS)
     duration = random.randint(5, 10)
     target_bw = random.choice(["15M", "30M", "50M"])
-    exec_in_container(src_container, f"iperf3 -c {dst_ip} -B {src_ip} -t {duration} -b {target_bw}")
+    exec_in_container(src_container, f"iperf3 -c {dst_ip} -p {port} -B {src_ip} -t {duration} -b {target_bw}")
 
 
 def main():
@@ -125,10 +135,11 @@ def main():
     host_keys = list(hosts.keys())
 
     print("\n" + "=" * 70)
-    print("[*] BẮT ĐẦU SINH TẢI LIÊN TỤC VÀO MẠNG DCN SPİNE-LEAF")
+    print("[*] BẮT ĐẦU SINH TẢI LIÊN TỤC VÀO MẠNG DCN SPINE-LEAF (v2)")
     print(f"    - Tỷ lệ luồng Voi (Elephant) : {int(ELEPHANT_FLOW_RATIO * 100)}%")
-    print(f"    - Tỷ lệ luồng Chuột (Mice)   : {int((1 - ELEPHANT_FLOW_RATIO) * 100)}%")
-    print("    - Chế độ chạy                : VÔ HẠN (Chỉ dừng khi bấm Ctrl + C)")
+    print(f"    - Tỷ lệ luồng Chuột (Mice)   : {int((1 - ELEPHANT_FLOW_RATIO) * 100)}% (TCP burst + Ping)")
+    print(f"    - Cổng iperf3 đa kênh        : {IPERF_PORTS} (chống lỗi server busy)")
+    print("    - Chế độ chạy                : VÔ HẠN (Dừng bằng Ctrl + C)")
     print("=" * 70 + "\n")
 
     start_time = time.time()

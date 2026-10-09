@@ -115,6 +115,16 @@ def build_docker_dcn():
     # Thiết lập default route cho container Internet
     inet_host.cmd("ip route add default dev inet-eth0")
 
+    info("[*] Bước 5.1: Thiết lập cổng nội bộ NFV Proxy (proxy-int) trên Access Leaf Switches...\n")
+    for i, a_sw in enumerate(access_switches):
+        sw_name = a_sw.name
+        proxy_ip = f"10.255.0.{i+1}/24"
+        # Tạo cổng nội bộ OVS để nhúng NFV Proxy trực tiếp trên switch
+        a_sw.cmd(f"ovs-vsctl add-port {sw_name} proxy-int -- set Interface proxy-int type=internal")
+        a_sw.cmd(f"ip addr add {proxy_ip} dev proxy-int")
+        a_sw.cmd("ip link set dev proxy-int up")
+        info(f"    - Switch {sw_name}: Cổng 'proxy-int' sẵn sàng (IP: {proxy_ip})\n")
+
     info("[+] Đang đợi 2s để Ryu Controller quét cấu trúc liên kết qua LLDP...\n")
     time.sleep(2)
 
