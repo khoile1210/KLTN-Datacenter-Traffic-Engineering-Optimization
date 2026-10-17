@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """
 Tên file: traffic_generator.py
-Mô tả   : Sinh tải mạng liên tục trên môi trường DOCKER CONTAINER (Containernet):
-          - Hỗ trợ đa cổng iperf3 (5201, 5202, 5203, 5204) trên mỗi host để giải quyết triệt để lỗi "server busy".
-          - Sinh đan xen 80% luồng Chuột (Mice - kết hợp cả TCP ngắn 20-50KB và Ping) và 20% luồng Voi (Elephant - iperf3 tải nặng).
-          - Luồng Chuột TCP ngắn tạo ra đúng đặc trưng 2 chiều (sbytes/dbytes, Ratio) cho mô hình học máy.
-          - Quản lý tiến trình an toàn, tự động dọn dẹp khi bấm Ctrl + C.
+Mô tả   : Bộ sinh lưu lượng nền thống nhất cho mạng Datacenter SDN Spine-Leaf:
+          - Tích hợp module toán học UnifiedCdfSampler (ACM SIGCOMM 2015).
+          - Đồng nhất 100% công cụ iperf3 qua cơ chế gửi đúng S_scaled Bytes (-n).
+          - Điều hướng máy đích theo phân phối 3 vùng Locality (Intra, Extra, Extra-DC).
+          - Điều phối nhịp phát mở rộng (Time Dilation) dựa trên năng lực CPU máy ảo.
+          - Hỗ trợ đa cổng iperf3 (5201-5204) để chống nghẽn 'server busy'.
+          - Chế độ mặc định: Chạy liên tục vô hạn cho đến khi người dùng chủ động ngắt (Ctrl + C hoặc SIGTERM).
+          - Hỗ trợ ngắt tức thì (Instant Interrupt) và dọn dẹp sạch sẽ 100% tiến trình iperf3 trên toàn bộ container.
 """
 
 import subprocess
@@ -14,30 +17,42 @@ import random
 import re
 import sys
 import signal
+import os
+import argparse
 
-# ==============================================================================
-# CẤU HÌNH THỰC NGHIỆM
-# ==============================================================================
-ELEPHANT_FLOW_RATIO = 0.20   # 20% luồng Voi, 80% luồng Chuột
-MIN_DELAY_BETWEEN_FLOWS = 0.2
-MAX_DELAY_BETWEEN_FLOWS = 0.8
-IPERF_PORTS = [5201, 5202, 5203, 5204]  # Đa cổng để tránh nghẽn server busy
+# Đảm bảo UTF-8
+if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8')
+if sys.stderr and hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8')
+
+# Nạp module UnifiedCdfSampler
+try:
+    from unified_sampler import UnifiedCdfSampler
+except ImportError:
+    from controller.unified_sampler import UnifiedCdfSampler
 
 RUNNING = True
 
 
-def handle_sigint(sig, frame):
-    """Bắt sự kiện Ctrl + C để dừng vòng lặp an toàn."""
+def handle_stop_signal(sig, frame):
+    """
+    Bắt sự kiện Ctrl + C (SIGINT) hoặc SIGTERM để ngắt vòng lặp an toàn và tức thì.
+    Kích hoạt KeyboardInterrupt ngay lập tức để ngắt các lệnh time.sleep() không bị delay.
+    """
     global RUNNING
-    print("\n[!] Đang nhận tín hiệu dừng (Ctrl + C)... Vui lòng đợi dọn dẹp tiến trình.")
     RUNNING = False
+    raise KeyboardInterrupt
 
 
-signal.signal(signal.SIGINT, handle_sigint)
+# Đăng ký bắt tín hiệu dừng chủ động
+signal.signal(signal.SIGINT, handle_stop_signal)
+if hasattr(signal, "SIGTERM"):
+    signal.signal(signal.SIGTERM, handle_stop_signal)
 
 
 def discover_docker_hosts():
-    """Quét và lấy địa chỉ IP thuộc mạng DCN (10.0.0.x)."""
+    """Quét và lấy địa chỉ IP của các container Containernet (mn.h1 -> mn.h8, mn.inet)."""
     print("[*] Đang quét các Docker container của mạng DCN Spine-Leaf...")
     try:
         docker_ps = subprocess.check_output(
@@ -57,7 +72,7 @@ def discover_docker_hosts():
                     f"docker exec {c_name} ip -4 -o addr show",
                     shell=True
                 ).decode()
-                match = re.search(r"inet\s+(10\.0\.0\.[0-9]+)/\d+", ip_out)
+                match = re.search(r"inet\s+(10\.\d+\.\d+\.\d+)/\d+", ip_out)
                 if match:
                     ip_addr = match.group(1)
                     discovered_hosts[short_name] = {
@@ -74,106 +89,201 @@ def discover_docker_hosts():
     return discovered_hosts
 
 
-def exec_in_container(container_name, command, is_background=True):
-    """Thực thi lệnh bên trong container qua docker exec."""
+def exec_in_container(container_name, command, is_background=True, wait_timeout=None):
+    """
+    Thực thi lệnh bên trong container qua docker exec.
+    - Nếu is_background=True: Chạy ngầm trong container (-d) không chặn luồng chính.
+    - Nếu is_background=False: Đợi lệnh thực thi xong để đảm bảo tính tuần tự.
+    """
     bg_flag = "-d" if is_background else ""
     full_cmd = f"docker exec {bg_flag} {container_name} {command}"
-    subprocess.Popen(full_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if is_background:
+        return subprocess.Popen(full_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        try:
+            return subprocess.run(full_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=wait_timeout)
+        except Exception:
+            return None
 
 
-def start_iperf_servers(host_dict):
-    """Khởi động iperf3 server trên nhiều cổng lắng nghe song song (5201-5204)."""
-    print(f"[*] Khởi động iperf3 server đa cổng {IPERF_PORTS} trên toàn bộ container...")
+def start_iperf_servers(host_dict, iperf_ports):
+    """
+    Khởi động iperf3 server đa cổng trên toàn bộ các container:
+    1. Dọn dẹp sạch tiến trình iperf3 cũ trên toàn bộ host đồng thời.
+    2. Bật daemon iperf3 server trên từng cổng (5201-5204).
+    """
+    print(f"[*] Dọn dẹp tiến trình cũ và khởi động iperf3 server đa cổng {iperf_ports}...")
+    procs = []
     for h_name, h_info in host_dict.items():
-        exec_in_container(h_info["container_name"], "killall -9 iperf3 2>/dev/null", is_background=False)
-        for p in IPERF_PORTS:
-            exec_in_container(h_info["container_name"], f"iperf3 -s -p {p} -B {h_info['ip']} -D")
-    time.sleep(2)
-    print("[+] Toàn bộ iperf3 servers đa cổng đã sẵn sàng.")
+        cmd = f"docker exec {h_info['container_name']} killall -9 iperf3 2>/dev/null"
+        procs.append(subprocess.Popen(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+    for p in procs:
+        try:
+            p.wait(timeout=2)
+        except Exception:
+            pass
+
+    for h_name, h_info in host_dict.items():
+        for p in iperf_ports:
+            exec_in_container(h_info["container_name"], f"iperf3 -s -p {p} -B {h_info['ip']} -D", is_background=True)
+    time.sleep(1.5)
+    print(f"[+] Toàn bộ iperf3 servers ({len(host_dict)} hosts x {len(iperf_ports)} ports) đã sẵn sàng.")
 
 
 def cleanup_traffic_processes(host_dict):
-    """Dọn dẹp tiến trình ping và iperf3 khi người dùng bấm Ctrl + C."""
-    print("[*] Đang dọn dẹp các tiến trình client bên trong container...")
+    """
+    Dọn dẹp triệt để 100% các tiến trình iperf3 (cả client và server) bên trong container:
+    Thực thi song song trên toàn bộ 33 container và chờ hoàn tất (.wait())
+    trước khi thoát, đảm bảo không còn tiến trình rác chạy ngầm bắn trộm traffic.
+    """
+    print("\n[*] Đang dọn dẹp triệt để các tiến trình iperf3 trên toàn bộ container...")
+    procs = []
     for h_name, h_info in host_dict.items():
-        exec_in_container(h_info["container_name"], "killall -9 ping iperf3 2>/dev/null", is_background=False)
-    print("[+] Hoàn tất dọn dẹp. Tiến trình dừng hoàn toàn.")
+        cmd = f"docker exec {h_info['container_name']} killall -9 iperf3 2>/dev/null"
+        p = subprocess.Popen(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        procs.append(p)
+
+    for p in procs:
+        try:
+            p.wait(timeout=3)
+        except Exception:
+            pass
+    print("[+] Hoàn tất dọn dẹp. Mọi tiến trình iperf3 đã được giải phóng an toàn.")
 
 
-def send_mice_flow(src_container, src_ip, dst_ip):
-    """
-    Luồng Chuột (Mice Flow):
-    Đan xen 50% Ping nhỏ (ICMP) và 50% luồng TCP dung lượng nhỏ (10KB - 50KB) qua iperf3 -n
-    để sinh ra đầy đủ đặc trưng 2 chiều (sbytes/dbytes, Ratio).
-    """
-    port = random.choice(IPERF_PORTS)
-    if random.random() < 0.5:
-        # Gói tin ICMP nhỏ
-        pkt_bytes = random.randint(64, 256)
-        exec_in_container(src_container, f"ping -c 3 -s {pkt_bytes} -i 0.2 {dst_ip}")
-    else:
-        # Phiên TCP truyền ngắn 20K - 50K kết thúc ngay
-        burst_size = random.choice(["20K", "30K", "50K"])
-        exec_in_container(src_container, f"iperf3 -c {dst_ip} -p {port} -B {src_ip} -n {burst_size}")
+def parse_duration_arg(val):
+    """Hỗ trợ linh hoạt cả số giây (3600, 3600s), số phút (60m) lẫn số giờ (1h, 1.5h)."""
+    if val is None:
+        return None
+    val_str = str(val).strip().lower()
+    try:
+        if val_str.endswith("h"):
+            return float(val_str[:-1]) * 3600.0
+        elif val_str.endswith("m"):
+            return float(val_str[:-1]) * 60.0
+        elif val_str.endswith("s"):
+            return float(val_str[:-1])
+        return float(val_str)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"Định dạng thời gian không hợp lệ: '{val}'. Ví dụ hợp lệ: 3600, 1h, 60m, 1800s.")
 
 
-def send_elephant_flow(src_container, src_ip, dst_ip):
-    """Luồng Voi (Elephant Flow): iperf3 TCP duy trì băng thông lớn (15M-50M) từ 5 -> 10 giây."""
-    port = random.choice(IPERF_PORTS)
-    duration = random.randint(5, 10)
-    target_bw = random.choice(["15M", "30M", "50M"])
-    exec_in_container(src_container, f"iperf3 -c {dst_ip} -p {port} -B {src_ip} -t {duration} -b {target_bw}")
+def parse_arguments():
+    """Hỗ trợ tùy chọn dòng lệnh linh hoạt nếu muốn giới hạn thời gian/số luồng."""
+    parser = argparse.ArgumentParser(
+        description="Unified DCN Traffic Generator (Facebook SIGCOMM 2015 Workload)"
+    )
+    parser.add_argument(
+        "--duration", type=parse_duration_arg, default=None,
+        help="Thời gian sinh tải tối đa (hỗ trợ số giây như 3600, hoặc chuỗi thời gian như 1h, 60m). Mặc định: None (chạy liên tục vô hạn cho tới khi người dùng chủ động ngắt bằng Ctrl + C)"
+    )
+    parser.add_argument(
+        "--flows", type=int, default=None,
+        help="Số lượng luồng tối đa cần phát. Mặc định: None (chạy liên tục vô hạn cho tới khi người dùng chủ động ngắt bằng Ctrl + C)"
+    )
+    parser.add_argument(
+        "--config", type=str, default=None,
+        help="Đường dẫn file cấu hình traffic_config.json"
+    )
+    return parser.parse_args()
 
 
 def main():
+    args = parse_arguments()
+
     hosts = discover_docker_hosts()
     if len(hosts) < 2:
-        print("[!] Không tìm thấy đủ container với IP 10.0.0.x. Kiểm tra lại topology!")
+        print("[!] Không tìm thấy đủ container với IP mạng 10.x.x.x. Hãy khởi động spine_leaf_topo.py trước!")
         sys.exit(1)
 
-    start_iperf_servers(hosts)
-    host_keys = list(hosts.keys())
+    sampler = UnifiedCdfSampler(config_path=args.config)
+    start_iperf_servers(hosts, sampler.iperf_ports)
 
-    print("\n" + "=" * 70)
-    print("[*] BẮT ĐẦU SINH TẢI LIÊN TỤC VÀO MẠNG DCN SPINE-LEAF (v2)")
-    print(f"    - Tỷ lệ luồng Voi (Elephant) : {int(ELEPHANT_FLOW_RATIO * 100)}%")
-    print(f"    - Tỷ lệ luồng Chuột (Mice)   : {int((1 - ELEPHANT_FLOW_RATIO) * 100)}% (TCP burst + Ping)")
-    print(f"    - Cổng iperf3 đa kênh        : {IPERF_PORTS} (chống lỗi server busy)")
-    print("    - Chế độ chạy                : VÔ HẠN (Dừng bằng Ctrl + C)")
-    print("=" * 70 + "\n")
+    # Danh sách các host nội bộ tham gia phát sinh luồng
+    internal_hosts = [h for h in hosts.keys() if h != "inet"]
+
+    mode_desc = "VÔ HẠN (Chỉ dừng khi người dùng chủ động bấm Ctrl + C)"
+    if args.duration:
+        hours = args.duration / 3600.0
+        mins = args.duration / 60.0
+        if hours >= 1.0:
+            time_str = f"{hours:.2f} giờ ({args.duration:,.0f} giây)"
+        else:
+            time_str = f"{mins:.2f} phút ({args.duration:,.0f} giây)"
+        mode_desc = f"HẸN GIỜ: {time_str} (Tự động dừng hoặc bấm Ctrl + C để ngắt sớm)"
+    elif args.flows:
+        mode_desc = f"Giới hạn số luồng: {args.flows:,} luồng (hoặc bấm Ctrl + C để dừng sớm)"
+
+    print("\n" + "=" * 80)
+    print("[*] BẮT ĐẦU SINH TẢI DATACENTER THỐNG NHẤT (UNIFIED DCN WORKLOAD - v3)")
+    print(f"    - Băng thông cấu hình : {sampler.c_host} Mbps (Hệ số scale alpha = {sampler.alpha:.5f})")
+    print(f"    - Giãn nhịp phát      : {sampler.d_arrival:.1f}x (Bảo toàn độ tải CPU máy chủ ảo)")
+    print(f"    - Phân bổ 3 vùng      : Intra={sampler.r_intra*100:.1f}%, Extra={sampler.r_extra*100:.1f}%, Internet={sampler.r_dc*100:.1f}%")
+    print(f"    - Cổng iperf3 đa kênh : {sampler.iperf_ports} (Chống nghẽn server busy)")
+    print(f"    - Công cụ phát        : Đồng nhất iperf3 -n {{S_scaled}} cho mọi luồng")
+    print(f"    - Chế độ hoạt động    : {mode_desc}")
+    print("=" * 80 + "\n")
 
     start_time = time.time()
     flow_count = 0
+    zone_stats = {"INTRA_RACK": 0, "EXTRA_RACK": 0, "EXTRA_DC": 0}
 
     try:
         while RUNNING:
-            src_name = random.choice(host_keys)
-            dst_name = random.choice(host_keys)
-            while dst_name == src_name:
-                dst_name = random.choice(host_keys)
+            # Kiểm tra điều kiện dừng tự động nếu có cấu hình tham số CLI
+            if args.duration and (time.time() - start_time) >= args.duration:
+                print(f"\n[*] Đã đạt giới hạn thời gian chạy ({args.duration}s). Tự động dừng sinh tải.")
+                break
+            if args.flows and flow_count >= args.flows:
+                print(f"\n[*] Đã phát đủ {args.flows:,} luồng. Tự động dừng sinh tải.")
+                break
 
-            src_container = hosts[src_name]["container_name"]
-            src_ip = hosts[src_name]["ip"]
-            dst_ip = hosts[dst_name]["ip"]
+            # 1. Chọn host nguồn ngẫu nhiên từ các host nội bộ
+            src_name = random.choice(internal_hosts)
+            src_info = hosts[src_name]
+
+            # 2. Lấy mẫu đích theo 3 vùng Locality
+            dst_name, zone = sampler.sample_destination(src_name, hosts)
+            dst_info = hosts[dst_name]
+            zone_stats[zone] = zone_stats.get(zone, 0) + 1
+
+            # 3. Lấy mẫu kích thước luồng (Bytes) từ ECDF Facebook
+            s_raw, s_scaled = sampler.sample_flow_size()
+
+            # 4. Lấy mẫu khoảng thời gian chờ (Giây) từ ECDF Inter-Arrival
+            dt_raw, dt_scaled = sampler.sample_inter_arrival()
+
+            # 5. Chọn cổng iperf3 ngẫu nhiên trong danh sách đa cổng
+            port = random.choice(sampler.iperf_ports)
 
             flow_count += 1
             elapsed_min = (time.time() - start_time) / 60
 
-            if random.random() < ELEPHANT_FLOW_RATIO:
-                print(f"[{time.strftime('%H:%M:%S')}] [#{flow_count:,} | {elapsed_min:.1f}m] [ELEPHANT] {src_name} ({src_ip}) -> {dst_name} ({dst_ip})")
-                send_elephant_flow(src_container, src_ip, dst_ip)
-            else:
-                send_mice_flow(src_container, src_ip, dst_ip)
+            # Hiển thị thông tin luồng định kỳ hoặc khi có luồng lớn
+            if flow_count % 10 == 0 or s_scaled >= 50000:
+                print(f"[{time.strftime('%H:%M:%S')}] [#{flow_count:,} | {elapsed_min:.1f}m] [{zone:<10}] {src_name} ({src_info['ip']}) -> {dst_name} ({dst_info['ip']}) | Port: {port} | Size: {s_scaled:,.0f} B (raw: {s_raw:,.0f} B) | Sleep: {dt_scaled*1000:.1f}ms")
 
-            time.sleep(random.uniform(MIN_DELAY_BETWEEN_FLOWS, MAX_DELAY_BETWEEN_FLOWS))
+            # 6. Phát luồng TCP đồng nhất bằng iperf3 -n
+            # Dùng -n để truyền đúng số bytes mẫu, để mạng tự quyết định FCT và thông lượng
+            iperf_cmd = f"iperf3 -c {dst_info['ip']} -p {port} -B {src_info['ip']} -n {s_scaled}"
+            exec_in_container(src_info["container_name"], iperf_cmd, is_background=True)
 
+            # 7. Nghỉ đúng khoảng thời gian giãn nhịp ECDF
+            time.sleep(dt_scaled)
+
+    except KeyboardInterrupt:
+        print("\n[!] Đã nhận tín hiệu ngắt chủ động từ người dùng (Ctrl + C). Đang tiến hành dừng...")
     except Exception as e:
-        print(f"\n[!] Lỗi phát sinh: {e}")
-
+        print(f"\n[!] Lỗi phát sinh trong quá trình sinh tải: {e}")
     finally:
         total_time_sec = time.time() - start_time
-        print(f"\n[+] Tổng thời gian sinh tải: {total_time_sec / 60:.2f} phút.")
-        print(f"[+] Tổng số luồng đã phát sinh: {flow_count:,} flows.")
+        print("\n" + "=" * 80)
+        print("[*] TỔNG KẾT TIẾN TRÌNH SINH TẢI:")
+        print(f"    - Thời gian chạy thực tế : {total_time_sec / 60:.2f} phút ({total_time_sec:.1f} giây)")
+        print(f"    - Tổng số luồng đã phát  : {flow_count:,} luồng")
+        if flow_count > 0:
+            print(f"    - Tỷ lệ 3 vùng phân bổ   : Intra={zone_stats['INTRA_RACK']/flow_count*100:.1f}%, Extra={zone_stats['EXTRA_RACK']/flow_count*100:.1f}%, Internet={zone_stats['EXTRA_DC']/flow_count*100:.1f}%")
+        print("=" * 80)
         cleanup_traffic_processes(hosts)
 
 

@@ -1,50 +1,108 @@
 #!/usr/bin/env python3
 """
 Tên file: management_plane.py
-Mô tả   : Tầng Quản trị (Management Plane) hoàn thiện cho Ryu OF1.3:
-          - Thu thập và chuẩn hóa bộ 10 FEATURES phục vụ huấn luyện Flow Classification:
-            + Nhóm 1 (Trực tiếp từ OVS): dur, sbytes, dbytes, Spkts, Dpkts
-            + Nhóm 2 (Phái sinh có bảo vệ chia 0): Sload, Dload, smeansz, dmeansz, Ratio
-          - Lần vết TOÀN BỘ ĐƯỜNG ĐI CỤ THỂ NHẤT (Full End-to-End Hop-by-Hop):
-            Hiển thị rõ từ Host nguồn -> Switch Ingress [in->out] -> Aggregation [in->out] -> Core [in->out] -> Egress [in->out] -> Host đích.
-          - Ghép cặp Luồng đối xứng (Bidirectional Flow Pairing) từ OpenFlow Flow Stats.
-          - Thu thập các chỉ số sức khỏe Switch và Container không gây nghẽn chu kỳ Polling.
+Mô tả   : Tầng Quản trị & Telemetry Toàn Diện (Comprehensive Management Plane) cho SDN-AI DCN:
+          Phục vụ đồng thời 3 mục đích cốt lõi:
+          1. THU THẬP DATA (DATASET COLLECTION CHO AI / MACHINE LEARNING):
+             - Thu thập bộ 10 Features chuẩn: dur, sbytes, dbytes, Spkts, Dpkts, Sload, Dload, smeansz, dmeansz, Ratio.
+             - Bổ sung đặc trưng mở rộng: pkt_rate, byte_rate, phân vùng Locality (Intra-Rack, Extra-Rack, Extra-DC).
+             - Lần vết ĐƯỜNG ĐI CHI TIẾT TỪNG CHẶNG (Full End-to-End Hop-by-Hop Path) và hop_count.
+             - Ghép cặp Bi-flow đối xứng và gán nhãn Ground-Truth (1: Elephant, 0: Mice).
+             - Xuất file: results/traffic_flow_dataset_with_paths.csv.
+          2. GIÁM SÁT HỆ THỐNG & MẠNG (REAL-TIME SYSTEM & NETWORK MONITORING):
+             - Giám sát Switch OVS: CPU (%), RAM (MB), TCAM Table 0 active rules, Tx/Rx bytes, throughput (Mbps), drops, errors.
+             - Giám sát Docker Host Containers: CPU (%), RAM used (MB), RAM limit (MB), RAM (%), Network Rx/Tx bytes, Network I/O (Mbps).
+             - Giám sát Liên kết (Link Telemetry): Băng thông tức thời (Mbps), Capacity, Tỷ lệ sử dụng link (Utilization %), Drop delta.
+             - Xuất file: results/device_resource_utilization.csv, results/system_and_network_health.csv, results/link_utilization_telemetry.csv.
+          3. ĐÁNH GIÁ HIỆU NĂNG & BENCHMARK KPIS (ACADEMIC PERFORMANCE EVALUATION):
+             - Tổng thông lượng toàn mạng (Total Throughput Mbps).
+             - Mức độ chiếm dụng đường cắt ngang Core-Agg (Bisection Bandwidth Utilization %).
+             - Tỷ lệ rớt gói toàn mạng (Overall Packet Loss Rate %).
+             - Chỉ số công bằng Jain's Fairness Index trên các đường truyền song song Core-Agg.
+             - Độ lệch chuẩn tải giữa các link lõi (Link Utilization Standard Deviation - thước đo cân bằng tải ECMP vs AI).
+             - Thời gian hoàn thành trung bình của luồng Chuột (Mice Flow Completion Time indicator).
+             - Xuất file: results/network_evaluation_kpis.csv.
 """
 
 import os
+import sys
 import time
 import subprocess
 import re
 import requests
+import json
+import numpy as np
 import pandas as pd
 import networkx as nx
 import psutil
+import threading
 from datetime import datetime
 
+# Đảm bảo UTF-8
+if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8')
+if sys.stderr and hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8')
+
 RYU_REST_URL = "http://127.0.0.1:8080"
-RESULTS_DIR = "results"
+RESULTS_DIR = os.path.join(os.path.dirname(__file__), "..", "results")
+if not os.path.exists(RESULTS_DIR):
+    RESULTS_DIR = os.path.join(os.path.dirname(__file__), "results")
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
+# 1. Các tệp tin kết quả xuất ra (4 luồng chuyên biệt)
 OUTPUT_FLOW_CSV = os.path.join(RESULTS_DIR, "traffic_flow_dataset_with_paths.csv")
+OUTPUT_DEVICE_CSV = os.path.join(RESULTS_DIR, "device_resource_utilization.csv")
 OUTPUT_HEALTH_CSV = os.path.join(RESULTS_DIR, "system_and_network_health.csv")
+OUTPUT_LINK_CSV = os.path.join(RESULTS_DIR, "link_utilization_telemetry.csv")
+OUTPUT_KPI_CSV = os.path.join(RESULTS_DIR, "network_evaluation_kpis.csv")
+
 POLL_INTERVAL_SEC = 1.0
 
 # Ngưỡng phân loại Ground Truth cho luồng Voi (Elephant Flow)
 ELEPHANT_BYTE_RATE_THRESHOLD = 1024 * 1024       # 1 MB/s (Sload > 1 MB/s)
 ELEPHANT_TOTAL_BYTES_THRESHOLD = 5 * 1024 * 1024 # 5 MB (sbytes > 5 MB)
 
-# Bộ 10 Features chuẩn theo yêu cầu + Metadata & Routing Path
+# ==============================================================================
+# ĐỊNH NGHĨA CẤU TRÚC TIÊU ĐỀ CSV CHO 4 BỘ METRICS
+# ==============================================================================
+# Bộ 1: Dataset luồng cho AI (10 Features + Hop-by-Hop + Metadata)
 FLOW_CSV_HEADERS = [
     "timestamp", "src_ip", "dst_ip", "src_port", "dst_port", "protocol",
     "dur", "sbytes", "dbytes", "Spkts", "Dpkts",
     "Sload", "Dload", "smeansz", "dmeansz", "Ratio",
-    "hop_count", "path", "label"
+    "hop_count", "path", "label",
+    "src_host", "dst_host", "locality", "pkt_rate", "byte_rate"
+]
+
+# Bộ 2: Giám sát tài nguyên thiết bị (Switch & Host Containers)
+DEVICE_CSV_HEADERS = [
+    "timestamp", "node_name", "node_type", "cpu_percent",
+    "memory_usage_mb", "memory_limit_mb", "memory_percent",
+    "network_rx_bytes", "network_tx_bytes", "network_rx_mbps", "network_tx_mbps",
+    "packet_drop_count", "tcam_entries"
 ]
 
 HEALTH_CSV_HEADERS = [
     "timestamp", "node_name", "node_type", "cpu_usage_pct", "ram_used_mb",
-    "tcam_entries", "total_tx_bytes", "total_rx_bytes", "total_tx_dropped",
-    "total_rx_dropped", "total_errors"
+    "ram_limit_mb", "ram_usage_pct", "tcam_entries", "total_tx_bytes", "total_rx_bytes",
+    "tx_mbps", "rx_mbps", "total_tx_dropped", "total_rx_dropped", "total_errors"
+]
+
+# Bộ 3: Giám sát & Đánh giá đường truyền liên kết (Link Telemetry for GAT/PPO)
+LINK_CSV_HEADERS = [
+    "timestamp", "src_node", "dst_node", "src_port", "dst_port",
+    "link_type", "capacity_mbps", "tx_bytes_delta", "tx_rate_mbps",
+    "utilization_pct", "tx_dropped_delta", "tx_errors_delta"
+]
+
+# Bộ 4: Chỉ số KPI đánh giá toàn mạng & Benchmark (Network KPIs)
+KPI_CSV_HEADERS = [
+    "timestamp", "active_flows_count", "active_elephant_flows", "active_mice_flows",
+    "total_network_throughput_mbps", "bisection_utilization_pct",
+    "overall_packet_loss_rate_pct", "total_network_drops",
+    "jains_fairness_index", "link_util_std_dev",
+    "avg_hop_count", "avg_mice_duration_sec"
 ]
 
 
@@ -64,33 +122,244 @@ def parse_action_helper(act):
     return None, None
 
 
-class EnhancedManagementPlane:
-    def __init__(self, rest_url, flow_csv, health_csv):
+def parse_size_bytes(val_str):
+    """Chuyển đổi chuỗi dung lượng (12.5MiB, 1024MB, 500kB, 1.2GB) sang số Bytes."""
+    if not val_str or not isinstance(val_str, str):
+        return 0.0
+    val_str = val_str.strip().upper()
+    m = re.match(r"^([\d\.]+)\s*([A-Z]*)$", val_str)
+    if not m:
+        return 0.0
+    try:
+        num = float(m.group(1))
+        unit = m.group(2)
+        if "G" in unit:
+            return num * 1024.0 * 1024.0 * 1024.0
+        elif "M" in unit:
+            return num * 1024.0 * 1024.0
+        elif "K" in unit:
+            return num * 1024.0
+        return num
+    except Exception:
+        return 0.0
+
+
+class DockerStatsCollectorThread(threading.Thread):
+    """
+    Luồng nền chuyên trách thu thập số liệu Docker Containers (CPU, RAM, Net I/O).
+    Chạy bất đồng bộ để vòng lặp chính của Management Plane không bị nghẽn (zero block),
+    ngăn ngừa triệt để lỗi TimeoutExpired khi hệ thống có 33 containers hoạt động dưới tải cao.
+    Có cơ chế Stale Cache Retention lưu giữ snapshot mới nhất khi có lỗi tạm thời.
+    """
+    def __init__(self, poll_interval=2.0, timeout=8.0):
+        super().__init__(daemon=True)
+        self.poll_interval = poll_interval
+        self.timeout = timeout
+        self.lock = threading.Lock()
+        self.running = True
+        self.cached_container_stats = {}
+        self.last_update_time = 0.0
+
+    def run(self):
+        while self.running:
+            try:
+                cmd = "docker stats --no-stream --format '{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.NetIO}}'"
+                output = subprocess.check_output(cmd, shell=True, stderr=subprocess.DEVNULL, timeout=self.timeout).decode()
+                parsed = {}
+                for line in output.strip().split("\n"):
+                    if not line or "\t" not in line:
+                        continue
+                    parts = line.split("\t")
+                    if len(parts) >= 5:
+                        raw_name = parts[0].strip()
+                        c_name = raw_name.replace("mn.", "") if raw_name.startswith("mn.") else raw_name
+                        cpu_raw = parts[1].replace("%", "").strip()
+                        try:
+                            cpu_pct = float(cpu_raw) if cpu_raw else 0.0
+                        except ValueError:
+                            cpu_pct = 0.0
+
+                        # Phân tích RAM: used / limit
+                        mem_parts = parts[2].split("/")
+                        mem_used_bytes = parse_size_bytes(mem_parts[0]) if len(mem_parts) > 0 else 0.0
+                        mem_limit_bytes = parse_size_bytes(mem_parts[1]) if len(mem_parts) > 1 else 1024.0 * 1024 * 1024
+                        mem_used_mb = mem_used_bytes / (1024.0 * 1024.0)
+                        mem_limit_mb = mem_limit_bytes / (1024.0 * 1024.0)
+
+                        mem_pct_raw = parts[3].replace("%", "").strip()
+                        try:
+                            mem_pct = float(mem_pct_raw) if mem_pct_raw else (mem_used_mb / max(mem_limit_mb, 1.0) * 100.0)
+                        except ValueError:
+                            mem_pct = 0.0
+
+                        # Phân tích Network I/O: rx / tx
+                        net_parts = parts[4].split("/")
+                        net_rx_bytes = parse_size_bytes(net_parts[0]) if len(net_parts) > 0 else 0.0
+                        net_tx_bytes = parse_size_bytes(net_parts[1]) if len(net_parts) > 1 else 0.0
+
+                        parsed[c_name] = {
+                            "cpu_pct": cpu_pct,
+                            "mem_used_mb": mem_used_mb,
+                            "mem_limit_mb": mem_limit_mb,
+                            "mem_pct": mem_pct,
+                            "net_rx_bytes": net_rx_bytes,
+                            "net_tx_bytes": net_tx_bytes
+                        }
+                if parsed:
+                    with self.lock:
+                        self.cached_container_stats.update(parsed)
+                        self.last_update_time = time.time()
+            except Exception:
+                # Giữ nguyên Stale Cache khi gặp Timeout hoặc Docker Daemon bận
+                pass
+            time.sleep(self.poll_interval)
+
+    def get_stats(self):
+        with self.lock:
+            return dict(self.cached_container_stats)
+
+    def stop(self):
+        self.running = False
+
+
+class ComprehensiveManagementPlane:
+    def __init__(self, rest_url=RYU_REST_URL):
         self.rest_url = rest_url
-        self.flow_csv = flow_csv
-        self.health_csv = health_csv
+        self.flow_csv = OUTPUT_FLOW_CSV
+        self.device_csv = OUTPUT_DEVICE_CSV
+        self.health_csv = OUTPUT_HEALTH_CSV
+        self.link_csv = OUTPUT_LINK_CSV
+        self.kpi_csv = OUTPUT_KPI_CSV
+
         self.topo_graph = nx.DiGraph()
 
-        # Ánh xạ tĩnh ban đầu giữa IP Host và Switch gắn trực tiếp (được cập nhật động nếu cần)
-        self.host_switch_map = {f"10.0.0.{i}": i for i in range(1, 9)}
-        self.host_switch_map["10.0.0.100"] = 33
+        # Nạp cấu hình từ topology_config.json
+        self._load_topology_config()
+
+        # Bộ nhớ đệm phục vụ tính đạo hàm delta (thông lượng Mbps và drop rate)
+        self.last_port_stats = {}  # (dpid, port) -> (time, tx_bytes, rx_bytes, tx_pkts, rx_pkts, tx_dropped, errors)
+        self.last_host_stats = {}  # host_name -> (time, rx_bytes, tx_bytes)
+        self.last_time = time.time()
 
         self.flow_cache = {}
         self.group_bucket_cache = {}
 
+        # Khởi tạo CPU tracking
         psutil.cpu_percent(interval=None)
+
+        # Khởi tạo các file CSV nếu chưa tồn tại
         self._init_csv_files()
 
-    def _init_csv_files(self):
-        if not os.path.exists(self.flow_csv):
-            pd.DataFrame(columns=FLOW_CSV_HEADERS).to_csv(self.flow_csv, index=False)
-            print(f"[+] Khởi tạo file Dataset luồng (10 Features): {self.flow_csv}")
+        # Khởi tạo và kích hoạt Background Collector cho Docker stats (Zero-timeout, Non-blocking)
+        self.docker_collector = DockerStatsCollectorThread(poll_interval=2.0, timeout=8.0)
+        self.docker_collector.start()
 
-        if not os.path.exists(self.health_csv):
-            pd.DataFrame(columns=HEALTH_CSV_HEADERS).to_csv(self.health_csv, index=False)
-            print(f"[+] Khởi tạo file Sức khỏe hệ thống: {self.health_csv}")
+    def _load_topology_config(self):
+        """Nạp các thông số hạ tầng phần cứng và băng thông mở từ topology_config.json."""
+        config_path = os.path.join(os.path.dirname(__file__), "topology_config.json")
+        self.num_access = 8
+        self.num_agg = 4
+        self.num_core = 2
+        self.hosts_per_rack = 4
+        self.inet_ip = "10.0.0.100"
+
+        # Băng thông các tầng (Mbps)
+        self.bw_core_inet = 100.0
+        self.bw_core_agg = 100.0
+        self.bw_agg_access = 50.0
+        self.bw_access_host = 20.0
+
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, "r", encoding="utf-8") as f:
+                    cfg_data = json.load(f)
+                    sw_cfg = cfg_data.get("switches", {})
+                    self.num_access = int(sw_cfg.get("access", {}).get("count", 8))
+                    self.num_agg = int(sw_cfg.get("aggregation", {}).get("count", 4))
+                    self.num_core = int(sw_cfg.get("core", {}).get("count", 2))
+
+                    hosts_cfg = cfg_data.get("hosts", {})
+                    self.hosts_per_rack = int(hosts_cfg.get("hosts_per_rack", 4))
+                    raw_inet = hosts_cfg.get("inet_node", {}).get("ip", "10.0.0.100/24")
+                    self.inet_ip = raw_inet.split("/")[0]
+
+                    bw_cfg = cfg_data.get("links", {}).get("bandwidth_mbps", {})
+                    self.bw_core_inet = float(bw_cfg.get("core_inet", 100.0))
+                    self.bw_core_agg = float(bw_cfg.get("core_agg", 100.0))
+                    self.bw_agg_access = float(bw_cfg.get("agg_access", 50.0))
+                    self.bw_access_host = float(bw_cfg.get("access_host", 20.0))
+            except Exception as e:
+                print(f"[!] Cảnh báo nạp cấu hình: {e}. Sử dụng cấu hình mặc định.")
+
+        # Xây dựng danh bạ ánh xạ IP -> Switch DPID và Port cắm (1 rack = hosts_per_rack)
+        self.host_switch_map = {}
+        self.host_port_map = {}
+        for r in range(1, self.num_access + 1):
+            for h in range(1, self.hosts_per_rack + 1):
+                idx = (r - 1) * self.hosts_per_rack + h
+                ip = f"10.0.0.{idx}"
+                self.host_switch_map[ip] = r
+                self.host_port_map[ip] = self.num_agg + h
+
+        # Node inet ngoài DCN cắm vào Core Switch (c1 DPID 33, Port 1)
+        self.host_switch_map[self.inet_ip] = 33
+        self.host_port_map[self.inet_ip] = 1
+
+    def _init_csv_files(self):
+        """Khởi tạo toàn bộ 5 tệp tin CSV với header chuẩn nếu chưa tồn tại."""
+        files_headers = [
+            (self.flow_csv, FLOW_CSV_HEADERS, "Dataset luồng (10 Features + Hop-by-Hop)"),
+            (self.device_csv, DEVICE_CSV_HEADERS, "Giám sát tài nguyên thiết bị (CPU/RAM/Net IO)"),
+            (self.health_csv, HEALTH_CSV_HEADERS, "Sức khỏe hệ thống và switch OVS"),
+            (self.link_csv, LINK_CSV_HEADERS, "Giám sát & Đánh giá băng thông liên kết (Link Telemetry)"),
+            (self.kpi_csv, KPI_CSV_HEADERS, "Chỉ số KPI đánh giá toàn mạng (Benchmark KPIs)")
+        ]
+        for path, headers, desc in files_headers:
+            if not os.path.exists(path):
+                pd.DataFrame(columns=headers).to_csv(path, index=False)
+                print(f"[+] Khởi tạo file {desc}: {path}")
+
+    def format_dpid_name(self, dpid):
+        """Định dạng số DPID sang tên switch trực quan (a1..a8, ag1..ag4, c1..c2)."""
+        if 1 <= dpid <= self.num_access:
+            return f"a{dpid}"
+        elif 17 <= dpid <= 16 + self.num_agg:
+            return f"ag{dpid - 16}"
+        elif dpid in [33, 0x21]:
+            return "c1"
+        elif dpid in [34, 0x22]:
+            return "c2"
+        elif dpid >= 33:
+            return f"c{dpid - 32}"
+        return f"s{dpid}"
+
+    def ip_to_host_name(self, ip):
+        """Chuyển đổi địa chỉ IP sang định dạng tên host chuẩn h{rack}_{host} hoặc inet."""
+        if ip == self.inet_ip:
+            return "inet"
+        m = re.search(r"10\.0\.0\.(\d+)", ip)
+        if m:
+            host_idx = int(m.group(1))
+            r = (host_idx - 1) // self.hosts_per_rack + 1
+            h = (host_idx - 1) % self.hosts_per_rack + 1
+            return f"h{r}_{h}"
+        return ip
+
+    def get_link_type_and_capacity(self, src_name, dst_name):
+        """Xác định loại liên kết và dung lượng băng thông thiết kế (Capacity Mbps)."""
+        s, d = str(src_name).lower(), str(dst_name).lower()
+        if (s.startswith("c") and d.startswith("ag")) or (s.startswith("ag") and d.startswith("c")):
+            return "Core-Agg", self.bw_core_agg
+        elif (s.startswith("c") and "inet" in d) or ("inet" in s and d.startswith("c")):
+            return "Core-Inet", self.bw_core_inet
+        elif (s.startswith("ag") and s.startswith("a")) or (s.startswith("ag") and d.startswith("a")) or (s.startswith("a") and d.startswith("ag")):
+            return "Agg-Access", self.bw_agg_access
+        elif (s.startswith("a") and "h" in d) or ("h" in s and d.startswith("a")):
+            return "Access-Host", self.bw_access_host
+        return "Internal-Fabric", self.bw_agg_access
 
     def get_active_switches(self):
+        """Lấy danh sách các Switch đang kết nối tới Ryu Controller."""
         try:
             resp = requests.get(f"{self.rest_url}/stats/switches", timeout=0.8)
             if resp.status_code == 200:
@@ -110,7 +379,6 @@ class EnhancedManagementPlane:
                     dst_dpid = int(link["dst"]["dpid"], 16)
                     src_port = int(link["src"]["port_no"])
                     dst_port = int(link["dst"]["port_no"])
-                    # Lưu rõ cổng xuất và cổng nhập giữa 2 switch kề nhau
                     self.topo_graph.add_edge(src_dpid, dst_dpid, out_port=src_port, in_port=dst_port)
                     self.topo_graph.add_edge(dst_dpid, src_dpid, out_port=dst_port, in_port=src_port)
         except Exception:
@@ -174,26 +442,6 @@ class EnhancedManagementPlane:
 
         return chosen_port
 
-    def format_dpid_name(self, dpid):
-        if 1 <= dpid <= 8:
-            return f"a{dpid}"
-        elif 17 <= dpid <= 20:
-            return f"ag{dpid - 16}"
-        elif dpid in [33, 0x21]:
-            return "c1"
-        elif dpid in [34, 0x22]:
-            return "c2"
-        return f"s{dpid}"
-
-    def ip_to_host_name(self, ip):
-        m = re.search(r"10\.0\.0\.(\d+)", ip)
-        if m:
-            host_idx = int(m.group(1))
-            if host_idx == 100:
-                return "inet"
-            return f"h{host_idx}"
-        return ip
-
     def trace_full_path(self, src_ip, dst_ip, switch_flows_map):
         """
         Dò vết TOÀN BỘ ĐƯỜNG ĐI CHI TIẾT NHẤT (Full End-to-End Hop-by-Hop):
@@ -208,11 +456,11 @@ class EnhancedManagementPlane:
         if not ingress_dpid or not egress_dpid:
             return 0, f"{src_name} -> Unknown Route -> {dst_name}"
 
-        # Trường hợp 1: Hai host cắm trên cùng một Switch
+        # Trường hợp 1: Hai host cắm trên cùng một Switch (Intra-Rack)
         if ingress_dpid == egress_dpid:
             sw_name = self.format_dpid_name(ingress_dpid)
-            in_p = 5
-            out_p = 1 if dst_ip == "10.0.0.100" else 5
+            in_p = self.host_port_map.get(src_ip, 5)
+            out_p = self.host_port_map.get(dst_ip, 5)
             return 1, f"{src_name} -> {sw_name}[in:{in_p}->out:{out_p}] -> {dst_name}"
 
         # Trường hợp 2: Lộ trình đa chặng qua Spine-Leaf
@@ -220,9 +468,7 @@ class EnhancedManagementPlane:
         hop_segments = []
         visited = set()
         prev_out_port = None
-        current_in_port = 5  # Host cắm ở Port 5 trên Access Switch (hoặc Port 1 trên Core nếu inet)
-        if src_ip == "10.0.0.100":
-            current_in_port = 1
+        current_in_port = self.host_port_map.get(src_ip, 5)
 
         while current_dpid != egress_dpid and len(hop_segments) < 8:
             visited.add(current_dpid)
@@ -240,7 +486,8 @@ class EnhancedManagementPlane:
                                 out_port = self.determine_active_out_port(current_dpid, a_val)
                             elif a_type == "OUTPUT":
                                 out_port = a_val
-                    break
+                    if out_port:
+                        break
 
             # Fallback nếu OVS chưa có group stats: dùng shortest path từ topo graph
             if not out_port:
@@ -286,7 +533,7 @@ class EnhancedManagementPlane:
 
         # Chặng cuối cùng: Egress Switch chuyển tiếp ra Host đích
         egress_sw_name = self.format_dpid_name(egress_dpid)
-        final_out_port = 1 if dst_ip == "10.0.0.100" else 5
+        final_out_port = self.host_port_map.get(dst_ip, 5)
         hop_segments.append(f"{egress_sw_name}[in:{current_in_port}->out:{final_out_port}]")
 
         full_path_str = f"{src_name} -> " + " -> ".join(hop_segments) + f" -> {dst_name}"
@@ -299,7 +546,6 @@ class EnhancedManagementPlane:
         """
         raw_flows = {}
 
-        # Quét các flow rules trên tất cả các switch
         for dpid, flows in switch_flows_map.items():
             for f in flows:
                 m = f.get("match", {})
@@ -309,13 +555,12 @@ class EnhancedManagementPlane:
                 s_pt = m.get("tcp_src") or m.get("udp_src", 0)
                 d_pt = m.get("tcp_dst") or m.get("udp_dst", 0)
 
-                if s_ip and d_ip and s_ip.startswith("10.0.0.") and d_ip.startswith("10.0.0."):
+                if s_ip and d_ip and s_ip.startswith("10.") and d_ip.startswith("10."):
                     dur = float(f.get("duration_sec", 0)) + float(f.get("duration_nsec", 0)) / 1e9
                     pkts = int(f.get("packet_count", 0))
                     bytes_ = int(f.get("byte_count", 0))
 
                     direction_key = (s_ip, d_ip, s_pt, d_pt, proto)
-                    # Lưu flow có byte lớn nhất (tránh trùng lặp qua nhiều switch)
                     if direction_key not in raw_flows or bytes_ > raw_flows[direction_key]["bytes"]:
                         raw_flows[direction_key] = {
                             "dur": dur,
@@ -324,7 +569,6 @@ class EnhancedManagementPlane:
                             "dpid": dpid
                         }
 
-        # Ghép cặp hai chiều Forward (s -> d) và Backward (d -> s)
         processed_pairs = set()
         paired_records = []
 
@@ -338,7 +582,6 @@ class EnhancedManagementPlane:
 
             bwd_info = raw_flows.get(bwd_key, {"dur": 0.0, "pkts": 0, "bytes": 0})
 
-            # Xác định chiều đi (Forward: bên phát nhiều byte hơn hoặc bên gửi yêu cầu)
             if fwd_info["bytes"] >= bwd_info["bytes"]:
                 src_ip, dst_ip = s_ip, d_ip
                 src_port, dst_port = s_pt, d_pt
@@ -371,51 +614,79 @@ class EnhancedManagementPlane:
 
         return paired_records
 
-    def collect_health_metrics(self, active_dpids):
-        """Thu thập chỉ số CPU, RAM, TCAM và lỗi cổng mạng của toàn bộ Nút."""
+    # ==========================================================================
+    # 2. GIÁM SÁT TÀI NGUYÊN THIẾT BỊ (SWITCH & HOST TELEMETRY)
+    # ==========================================================================
+    def collect_device_telemetry(self, active_dpids, now_str, dt):
+        """
+        Thu thập toàn diện tài nguyên Host Containers và Switch OVS:
+        CPU %, RAM used (MB), RAM limit (MB), RAM %, Network Rx/Tx bytes, Network I/O (Mbps), Drop count.
+        """
+        device_records = []
         health_records = []
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        port_stats_by_dpid = {}
 
-        # 1. Đọc CPU/RAM Docker Container
+        # 1. Thu thập số liệu các Docker Containers từ Background Worker Thread (Zero-Latency, No-Timeout)
         try:
-            cmd = "docker stats --no-stream --format '{{.Name}},{{.CPUPerc}},{{.MemUsage}}'"
-            output = subprocess.check_output(cmd, shell=True, stderr=subprocess.DEVNULL).decode()
+            container_stats = self.docker_collector.get_stats()
+            for c_name, c_data in container_stats.items():
+                cpu_pct = c_data["cpu_pct"]
+                mem_used_mb = c_data["mem_used_mb"]
+                mem_limit_mb = c_data["mem_limit_mb"]
+                mem_pct = c_data["mem_pct"]
+                net_rx_bytes = c_data["net_rx_bytes"]
+                net_tx_bytes = c_data["net_tx_bytes"]
 
-            for line in output.strip().split("\n"):
-                if not line or not line.startswith("mn."):
-                    continue
-                parts = line.split(",")
-                if len(parts) >= 3:
-                    c_name = parts[0].replace("mn.", "")
-                    cpu_raw = parts[1].replace("%", "").strip()
-                    cpu_pct = float(cpu_raw) if cpu_raw else 0.0
+                # Tính tốc độ truyền tức thời (Mbps)
+                prev_host = self.last_host_stats.get(c_name, (time.time() - dt, net_rx_bytes, net_tx_bytes))
+                delta_rx = max(net_rx_bytes - prev_host[1], 0.0)
+                delta_tx = max(net_tx_bytes - prev_host[2], 0.0)
+                rx_mbps = round((delta_rx * 8.0) / (dt * 1e6), 3)
+                tx_mbps = round((delta_tx * 8.0) / (dt * 1e6), 3)
+                self.last_host_stats[c_name] = (time.time(), net_rx_bytes, net_tx_bytes)
 
-                    mem_part = parts[2].split("/")[0].strip()
-                    mem_mb = 0.0
-                    if "GiB" in mem_part or "GB" in mem_part:
-                        mem_mb = float(mem_part.replace("GiB", "").replace("GB", "").strip()) * 1024
-                    elif "MiB" in mem_part or "MB" in mem_part:
-                        mem_mb = float(mem_part.replace("MiB", "").replace("MB", "").strip())
-                    elif "KiB" in mem_part or "kB" in mem_part:
-                        mem_mb = float(mem_part.replace("KiB", "").replace("kB", "").strip()) / 1024
+                is_switch_container = c_name.startswith("a") or c_name.startswith("ag") or c_name.startswith("c")
+                node_type = "Switch (OVS)" if is_switch_container else "Host (Container)"
 
-                    health_records.append({
-                        "timestamp": now_str,
-                        "node_name": c_name,
-                        "node_type": "Host (Container)",
-                        "cpu_usage_pct": round(cpu_pct, 2),
-                        "ram_used_mb": round(mem_mb, 2),
-                        "tcam_entries": "-",
-                        "total_tx_bytes": "-",
-                        "total_rx_bytes": "-",
-                        "total_tx_dropped": 0,
-                        "total_rx_dropped": 0,
-                        "total_errors": 0
-                    })
+                dev_rec = {
+                    "timestamp": now_str,
+                    "node_name": c_name,
+                    "node_type": node_type,
+                    "cpu_percent": round(cpu_pct, 2),
+                    "memory_usage_mb": round(mem_used_mb, 2),
+                    "memory_limit_mb": round(mem_limit_mb, 2),
+                    "memory_percent": round(mem_pct, 2),
+                    "network_rx_bytes": int(net_rx_bytes),
+                    "network_tx_bytes": int(net_tx_bytes),
+                    "network_rx_mbps": rx_mbps,
+                    "network_tx_mbps": tx_mbps,
+                    "packet_drop_count": 0,
+                    "tcam_entries": "-"
+                }
+                device_records.append(dev_rec)
+
+                hlth_rec = {
+                    "timestamp": now_str,
+                    "node_name": c_name,
+                    "node_type": node_type,
+                    "cpu_usage_pct": round(cpu_pct, 2),
+                    "ram_used_mb": round(mem_used_mb, 2),
+                    "ram_limit_mb": round(mem_limit_mb, 2),
+                    "ram_usage_pct": round(mem_pct, 2),
+                    "tcam_entries": "-",
+                    "total_tx_bytes": int(net_tx_bytes),
+                    "total_rx_bytes": int(net_rx_bytes),
+                    "tx_mbps": tx_mbps,
+                    "rx_mbps": rx_mbps,
+                    "total_tx_dropped": 0,
+                    "total_rx_dropped": 0,
+                    "total_errors": 0
+                }
+                health_records.append(hlth_rec)
         except Exception:
             pass
 
-        # 2. Đọc CPU/RAM/TCAM Switch OVS
+        # 2. Thu thập Telemetry Switch OVS từ Ryu REST API theo Dynamic Resource Attribution Model
         ovs_cpu = 0.0
         ovs_ram_mb = 0.0
         for proc in psutil.process_iter(['name', 'cpu_percent', 'memory_info']):
@@ -426,30 +697,25 @@ class EnhancedManagementPlane:
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 pass
 
-        num_switches = max(len(active_dpids), 1)
-        per_switch_cpu = round(ovs_cpu / num_switches, 2)
-        per_switch_ram = round(ovs_ram_mb / num_switches, 2)
-
+        # PHA 1: Thu thập số liệu mạng & bảng luồng của toàn bộ active switches
+        sw_metrics = {}
         for dpid in active_dpids:
+            sw_name = self.format_dpid_name(dpid)
             tcam_count = 0
-            tx_bytes = 0
-            rx_bytes = 0
-            tx_dropped = 0
-            rx_dropped = 0
-            errors = 0
+            tx_bytes, rx_bytes = 0, 0
+            tx_pkts, rx_pkts = 0, 0
+            tx_dropped, rx_dropped, errors = 0, 0, 0
+            port_stats_by_dpid[dpid] = {}
 
-            # Đọc TCAM entries
+            # Đọc tổng số flow rules trên TOÀN BỘ các bảng (Table 0 + Table 1)
             try:
                 t_resp = requests.get(f"{self.rest_url}/stats/table/{dpid}", timeout=0.8)
                 if t_resp.status_code == 200:
-                    for t in t_resp.json().get(str(dpid), []):
-                        if t.get("table_id") == 0:
-                            tcam_count = t.get("active_count", 0)
-                            break
+                    tcam_count = sum(t.get("active_count", 0) for t in t_resp.json().get(str(dpid), []))
             except Exception:
                 pass
 
-            # Đọc Tx/Rx và Drop từ cổng Switch
+            # Đọc port statistics
             try:
                 p_resp = requests.get(f"{self.rest_url}/stats/port/{dpid}", timeout=0.8)
                 if p_resp.status_code == 200:
@@ -458,62 +724,274 @@ class EnhancedManagementPlane:
                         if str(p_raw).upper() == "LOCAL":
                             continue
                         try:
-                            if int(p_raw) >= 0xFFFFFF00:
+                            port_no = int(p_raw)
+                            if port_no >= 0xFFFFFF00:
                                 continue
                         except (ValueError, TypeError):
                             continue
 
-                        tx_bytes += int(ps.get("tx_bytes", 0))
-                        rx_bytes += int(ps.get("rx_bytes", 0))
-                        tx_dropped += int(ps.get("tx_dropped", 0))
-                        rx_dropped += int(ps.get("rx_dropped", 0))
-                        errors += int(ps.get("tx_errors", 0)) + int(ps.get("rx_errors", 0))
+                        p_tx_b = int(ps.get("tx_bytes", 0))
+                        p_rx_b = int(ps.get("rx_bytes", 0))
+                        p_tx_p = int(ps.get("tx_packets", 0))
+                        p_rx_p = int(ps.get("rx_packets", 0))
+                        p_tx_d = int(ps.get("tx_dropped", 0))
+                        p_rx_d = int(ps.get("rx_dropped", 0))
+                        p_err = int(ps.get("tx_errors", 0)) + int(ps.get("rx_errors", 0))
+
+                        tx_bytes += p_tx_b
+                        rx_bytes += p_rx_b
+                        tx_pkts += p_tx_p
+                        rx_pkts += p_rx_p
+                        tx_dropped += p_tx_d
+                        rx_dropped += p_rx_d
+                        errors += p_err
+
+                        port_stats_by_dpid[dpid][port_no] = {
+                            "tx_bytes": p_tx_b, "rx_bytes": p_rx_b,
+                            "tx_packets": p_tx_p, "rx_packets": p_rx_p,
+                            "tx_dropped": p_tx_d, "rx_dropped": p_rx_d,
+                            "errors": p_err
+                        }
             except Exception:
                 pass
 
-            health_records.append({
+            # Tính delta throughput & delta packets cho switch
+            prev_sw_port = self.last_port_stats.get((dpid, "TOTAL"), (time.time() - dt, tx_bytes, rx_bytes, tx_pkts, rx_pkts, tx_dropped, errors))
+            sw_delta_tx_b = max(tx_bytes - prev_sw_port[1], 0)
+            sw_delta_rx_b = max(rx_bytes - prev_sw_port[2], 0)
+            sw_delta_tx_p = max(tx_pkts - prev_sw_port[3], 0)
+            sw_delta_rx_p = max(rx_pkts - prev_sw_port[4], 0)
+            sw_tx_mbps = round((sw_delta_tx_b * 8.0) / (dt * 1e6), 3)
+            sw_rx_mbps = round((sw_delta_rx_b * 8.0) / (dt * 1e6), 3)
+
+            pps = round((sw_delta_tx_p + sw_delta_rx_p) / dt, 2)
+            self.last_port_stats[(dpid, "TOTAL")] = (time.time(), tx_bytes, rx_bytes, tx_pkts, rx_pkts, tx_dropped, errors)
+
+            sw_metrics[dpid] = {
+                "sw_name": sw_name,
+                "tcam_count": tcam_count,
+                "pps": pps,
+                "tx_bytes": tx_bytes,
+                "rx_bytes": rx_bytes,
+                "sw_tx_mbps": sw_tx_mbps,
+                "sw_rx_mbps": sw_rx_mbps,
+                "tx_dropped": tx_dropped,
+                "rx_dropped": rx_dropped,
+                "errors": errors
+            }
+
+        # PHA 2: Tính toán trọng số phân bổ tài nguyên động (Dynamic Attribution Model)
+        num_switches = max(len(active_dpids), 1)
+        w_base = 0.10 / num_switches
+        w_dynamic_budget = 0.90
+
+        total_pps = sum(m["pps"] for m in sw_metrics.values())
+        total_rules = sum(m["tcam_count"] for m in sw_metrics.values())
+
+        w_cpu_map = {}
+        w_ram_map = {}
+
+        for dpid, m in sw_metrics.items():
+            # 1. Trọng số động CPU (ưu tiên PPS 70%, Rules 30%)
+            if total_pps > 0 and total_rules > 0:
+                cpu_dyn = 0.70 * (m["pps"] / total_pps) + 0.30 * (m["tcam_count"] / total_rules)
+            elif total_rules > 0:
+                cpu_dyn = m["tcam_count"] / total_rules
+            elif total_pps > 0:
+                cpu_dyn = m["pps"] / total_pps
+            else:
+                cpu_dyn = 1.0 / num_switches
+
+            # 2. Trọng số động RAM (ưu tiên Rules 80%, PPS 20%)
+            if total_pps > 0 and total_rules > 0:
+                ram_dyn = 0.80 * (m["tcam_count"] / total_rules) + 0.20 * (m["pps"] / total_pps)
+            elif total_rules > 0:
+                ram_dyn = m["tcam_count"] / total_rules
+            elif total_pps > 0:
+                ram_dyn = m["pps"] / total_pps
+            else:
+                ram_dyn = 1.0 / num_switches
+
+            w_cpu_map[dpid] = w_base + w_dynamic_budget * cpu_dyn
+            w_ram_map[dpid] = w_base + w_dynamic_budget * ram_dyn
+
+        # Chuẩn hóa hậu kiểm (Post-normalization) bảo toàn chính xác 100% tổng tài nguyên OVS
+        sum_w_cpu = sum(w_cpu_map.values())
+        if sum_w_cpu > 0:
+            w_cpu_map = {d: w / sum_w_cpu for d, w in w_cpu_map.items()}
+        sum_w_ram = sum(w_ram_map.values())
+        if sum_w_ram > 0:
+            w_ram_map = {d: w / sum_w_ram for d, w in w_ram_map.items()}
+
+        # Ghi nhận số liệu vào device_records và health_records
+        for dpid, m in sw_metrics.items():
+            sw_name = m["sw_name"]
+            tcam_count = m["tcam_count"]
+            tx_bytes = m["tx_bytes"]
+            rx_bytes = m["rx_bytes"]
+            sw_tx_mbps = m["sw_tx_mbps"]
+            sw_rx_mbps = m["sw_rx_mbps"]
+            tx_dropped = m["tx_dropped"]
+            rx_dropped = m["rx_dropped"]
+            errors = m["errors"]
+
+            per_switch_cpu = round(ovs_cpu * w_cpu_map.get(dpid, 1.0 / num_switches), 2)
+            per_switch_ram = round(ovs_ram_mb * w_ram_map.get(dpid, 1.0 / num_switches), 2)
+
+            existing_dev = [r for r in device_records if r["node_name"] == sw_name]
+            if existing_dev:
+                existing_dev[0]["tcam_entries"] = tcam_count
+                existing_dev[0]["packet_drop_count"] = tx_dropped + rx_dropped
+                existing_dev[0]["cpu_percent"] = per_switch_cpu
+                existing_dev[0]["memory_usage_mb"] = per_switch_ram
+                existing_dev[0]["memory_percent"] = round((per_switch_ram / 1024.0) * 100.0, 2)
+            else:
+                device_records.append({
+                    "timestamp": now_str,
+                    "node_name": sw_name,
+                    "node_type": "Switch (OVS)",
+                    "cpu_percent": per_switch_cpu,
+                    "memory_usage_mb": per_switch_ram,
+                    "memory_limit_mb": 1024.0,
+                    "memory_percent": round((per_switch_ram / 1024.0) * 100.0, 2),
+                    "network_rx_bytes": rx_bytes,
+                    "network_tx_bytes": tx_bytes,
+                    "network_rx_mbps": sw_rx_mbps,
+                    "network_tx_mbps": sw_tx_mbps,
+                    "packet_drop_count": tx_dropped + rx_dropped,
+                    "tcam_entries": tcam_count
+                })
+
+            existing_hlth = [r for r in health_records if r["node_name"] == sw_name]
+            if existing_hlth:
+                existing_hlth[0]["tcam_entries"] = tcam_count
+                existing_hlth[0]["cpu_usage_pct"] = per_switch_cpu
+                existing_hlth[0]["ram_used_mb"] = per_switch_ram
+                existing_hlth[0]["ram_usage_pct"] = round((per_switch_ram / 1024.0) * 100.0, 2)
+            else:
+                health_records.append({
+                    "timestamp": now_str,
+                    "node_name": sw_name,
+                    "node_type": "Switch (OVS)",
+                    "cpu_usage_pct": per_switch_cpu,
+                    "ram_used_mb": per_switch_ram,
+                    "ram_limit_mb": 1024.0,
+                    "ram_usage_pct": round((per_switch_ram / 1024.0) * 100.0, 2),
+                    "tcam_entries": tcam_count,
+                    "total_tx_bytes": tx_bytes,
+                    "total_rx_bytes": rx_bytes,
+                    "tx_mbps": sw_tx_mbps,
+                    "rx_mbps": sw_rx_mbps,
+                    "total_tx_dropped": tx_dropped,
+                    "total_rx_dropped": rx_dropped,
+                    "total_errors": errors
+                })
+
+        return device_records, health_records, port_stats_by_dpid
+
+    # ==========================================================================
+    # 3. GIÁM SÁT LIÊN KẾT MẠNG (LINK TELEMETRY CHO GAT / PPO & NGHẼN MẠNG)
+    # ==========================================================================
+    def collect_link_telemetry(self, active_dpids, port_stats_by_dpid, now_str, dt):
+        """
+        Thu thập telemetry chi tiết cho từng đường link (Inter-switch & Access-Host):
+        Throughput (Mbps), Capacity (Mbps), Utilization %, Drop delta, Error delta.
+        """
+        link_records = []
+
+        # 1. Các liên kết Switch <-> Switch từ Topology Graph
+        for u, v, data in self.topo_graph.edges(data=True):
+            src_name = self.format_dpid_name(u)
+            dst_name = self.format_dpid_name(v)
+            src_port = data.get("out_port", 1)
+            dst_port = data.get("in_port", 1)
+
+            link_type, capacity = self.get_link_type_and_capacity(src_name, dst_name)
+
+            # Lấy thống kê cổng xuất tại src_dpid
+            p_stat = port_stats_by_dpid.get(u, {}).get(src_port, {})
+            cur_tx_bytes = p_stat.get("tx_bytes", 0)
+            cur_tx_drop = p_stat.get("tx_dropped", 0)
+            cur_err = p_stat.get("errors", 0)
+
+            cache_key = (u, src_port)
+            prev_stat = self.last_port_stats.get(cache_key, (time.time() - dt, cur_tx_bytes, 0, 0, 0, cur_tx_drop, cur_err))
+            delta_bytes = max(cur_tx_bytes - prev_stat[1], 0)
+            delta_drop = max(cur_tx_drop - prev_stat[5], 0)
+            delta_err = max(cur_err - prev_stat[6], 0)
+
+            tx_rate_mbps = round((delta_bytes * 8.0) / (dt * 1e6), 3)
+            util_pct = round(min((tx_rate_mbps / max(capacity, 1.0)) * 100.0, 100.0), 2)
+
+            self.last_port_stats[cache_key] = (time.time(), cur_tx_bytes, 0, 0, 0, cur_tx_drop, cur_err)
+
+            link_records.append({
                 "timestamp": now_str,
-                "node_name": self.format_dpid_name(dpid),
-                "node_type": "Switch (OVS)",
-                "cpu_usage_pct": per_switch_cpu,
-                "ram_used_mb": per_switch_ram,
-                "tcam_entries": tcam_count,
-                "total_tx_bytes": tx_bytes,
-                "total_rx_bytes": rx_bytes,
-                "total_tx_dropped": tx_dropped,
-                "total_rx_dropped": rx_dropped,
-                "total_errors": errors
+                "src_node": src_name,
+                "dst_node": dst_name,
+                "src_port": src_port,
+                "dst_port": dst_port,
+                "link_type": link_type,
+                "capacity_mbps": capacity,
+                "tx_bytes_delta": delta_bytes,
+                "tx_rate_mbps": tx_rate_mbps,
+                "utilization_pct": util_pct,
+                "tx_dropped_delta": delta_drop,
+                "tx_errors_delta": delta_err
             })
 
-        return health_records
+        # 2. Các liên kết Downlink từ Access Switch xuống Hosts
+        for ip, sw_dpid in self.host_switch_map.items():
+            if sw_dpid not in active_dpids:
+                continue
+            sw_name = self.format_dpid_name(sw_dpid)
+            host_name = self.ip_to_host_name(ip)
+            port_no = self.host_port_map.get(ip, 5)
+            link_type = "Core-Inet" if host_name == "inet" else "Access-Host"
+            capacity = self.bw_core_inet if host_name == "inet" else self.bw_access_host
 
-    def collect_and_save_all(self):
-        active_dpids = self.get_active_switches()
+            p_stat = port_stats_by_dpid.get(sw_dpid, {}).get(port_no, {})
+            cur_tx_bytes = p_stat.get("tx_bytes", 0)
+            cur_tx_drop = p_stat.get("tx_dropped", 0)
+            cur_err = p_stat.get("errors", 0)
 
-        # Thu thập sức khỏe hệ thống
-        health_records = self.collect_health_metrics(active_dpids)
-        if health_records:
-            pd.DataFrame(health_records).to_csv(self.health_csv, mode="a", header=False, index=False)
+            cache_key = (sw_dpid, port_no)
+            prev_stat = self.last_port_stats.get(cache_key, (time.time() - dt, cur_tx_bytes, 0, 0, 0, cur_tx_drop, cur_err))
+            delta_bytes = max(cur_tx_bytes - prev_stat[1], 0)
+            delta_drop = max(cur_tx_drop - prev_stat[5], 0)
+            delta_err = max(cur_err - prev_stat[6], 0)
 
-        if not active_dpids:
-            return
+            tx_rate_mbps = round((delta_bytes * 8.0) / (dt * 1e6), 3)
+            util_pct = round(min((tx_rate_mbps / max(capacity, 1.0)) * 100.0, 100.0), 2)
+            self.last_port_stats[cache_key] = (time.time(), cur_tx_bytes, 0, 0, 0, cur_tx_drop, cur_err)
 
-        self.update_topology_graph()
+            link_records.append({
+                "timestamp": now_str,
+                "src_node": sw_name,
+                "dst_node": host_name,
+                "src_port": port_no,
+                "dst_port": 1,
+                "link_type": link_type,
+                "capacity_mbps": capacity,
+                "tx_bytes_delta": delta_bytes,
+                "tx_rate_mbps": tx_rate_mbps,
+                "utilization_pct": util_pct,
+                "tx_dropped_delta": delta_drop,
+                "tx_errors_delta": delta_err
+            })
 
-        # Đọc Flow Table của tất cả các Switch
-        switch_flows_map = {}
-        for dpid in active_dpids:
-            try:
-                resp = requests.get(f"{self.rest_url}/stats/flow/{dpid}", timeout=0.8)
-                if resp.status_code == 200:
-                    switch_flows_map[dpid] = resp.json().get(str(dpid), [])
-            except Exception:
-                switch_flows_map[dpid] = []
+        return link_records
 
-        # Ghép cặp luồng 5-tuple đối xứng
+    # ==========================================================================
+    # 4. THU THẬP BỘ ĐẶC TRƯNG LUỒNG (10 FEATURES CHO AI CLASSIFIER)
+    # ==========================================================================
+    def collect_flow_dataset(self, active_dpids, switch_flows_map, now_str):
+        """
+        Thu thập bộ 10 Features và thông tin lần vết Hop-by-Hop phục vụ huấn luyện Machine Learning.
+        """
         paired_flows = self.extract_biflow_stats(switch_flows_map)
         flow_records = []
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        eps = 1e-6
 
         for f in paired_flows:
             src_ip = f["src_ip"]
@@ -528,18 +1006,32 @@ class EnhancedManagementPlane:
             Spkts = f["Spkts"]
             Dpkts = f["Dpkts"]
 
-            # ==================================================================
-            # TÍNH TOÁN BỘ ĐẶC TRƯNG PHÁI SINH (NHÓM 2) CÓ BẢO VỆ CHIA CHO 0
-            # ==================================================================
-            eps = 1e-6
+            if sbytes == 0 and dbytes == 0:
+                continue
+
+            # Tính toán 10 đặc trưng
             Sload = sbytes / max(dur, eps)
             Dload = dbytes / max(dur, eps)
             smeansz = sbytes / max(Spkts, 1)
             dmeansz = dbytes / max(Dpkts, 1)
             Ratio = sbytes / (dbytes + eps)
 
-            # Dò vết toàn bộ lộ trình cụ thể Hop-by-Hop
+            # Đặc trưng mở rộng
+            pkt_rate = (Spkts + Dpkts) / max(dur, eps)
+            byte_rate = (sbytes + dbytes) / max(dur, eps)
+
+            # Lần vết toàn bộ lộ trình cụ thể Hop-by-Hop
             hop_count, path_str = self.trace_full_path(src_ip, dst_ip, switch_flows_map)
+
+            # Xác định phân vùng phụ tải Locality
+            src_name = self.ip_to_host_name(src_ip)
+            dst_name = self.ip_to_host_name(dst_ip)
+            if src_ip == self.inet_ip or dst_ip == self.inet_ip:
+                locality = "Extra-DC"
+            elif self.host_switch_map.get(src_ip) == self.host_switch_map.get(dst_ip):
+                locality = "Intra-Rack"
+            else:
+                locality = "Extra-Rack"
 
             # Gán nhãn Ground Truth (1: Elephant, 0: Mice)
             is_elephant = 1 if (
@@ -566,24 +1058,171 @@ class EnhancedManagementPlane:
                 "Ratio": round(Ratio, 4),
                 "hop_count": hop_count,
                 "path": path_str,
-                "label": is_elephant
+                "label": is_elephant,
+                "src_host": src_name,
+                "dst_host": dst_name,
+                "locality": locality,
+                "pkt_rate": round(pkt_rate, 2),
+                "byte_rate": round(byte_rate, 2)
             })
 
+        return flow_records
+
+    # ==========================================================================
+    # 5. TÍNH TOÁN CÁC CHỈ SỐ KPI ĐÁNH GIÁ HIỆU NĂNG & BENCHMARK
+    # ==========================================================================
+    def compute_and_save_kpis(self, flow_records, link_records, health_records, now_str):
+        """
+        Tính toán các chỉ số đánh giá toàn mạng:
+        Throughput, Bisection Bandwidth, Packet Loss Rate %, Jain's Fairness Index, Mice FCT.
+        """
+        active_flows_count = len(flow_records)
+        active_elephant = sum(1 for f in flow_records if f["label"] == 1)
+        active_mice = active_flows_count - active_elephant
+
+        # 1. Tổng thông lượng mạng (Mbps): Tổng thông lượng chuyển giao tại các chặng biên xuống host
+        host_links = [l for l in link_records if l["link_type"] in ["Access-Host", "Core-Inet"]]
+        if host_links:
+            total_throughput = round(sum(l["tx_rate_mbps"] for l in host_links), 2)
+        else:
+            total_throughput = round(sum(f["Sload"] * 8.0 / 1e6 for f in flow_records), 2)
+
+        # 2. Mức độ chiếm dụng đường cắt ngang (Core-Agg bisection links)
+        core_agg_links = [l for l in link_records if l["link_type"] == "Core-Agg"]
+        if core_agg_links:
+            core_agg_utils = [l["utilization_pct"] for l in core_agg_links]
+            bisection_util = round(float(np.mean(core_agg_utils)), 2)
+
+            # 3. Chỉ số công bằng Jain's Fairness Index trên các liên kết trục Core-Agg
+            # J = (sum(u_i))^2 / (n * sum(u_i^2))
+            sum_u = sum(core_agg_utils)
+            sum_u_sq = sum(u ** 2 for u in core_agg_utils)
+            n_links = len(core_agg_utils)
+            if sum_u_sq > 0 and n_links > 0:
+                jains_idx = round(float((sum_u ** 2) / (n_links * sum_u_sq)), 4)
+            else:
+                jains_idx = 1.0  # Hoàn toàn công bằng khi mạng đang rỗi
+
+            link_std = round(float(np.std(core_agg_utils)), 2)
+        else:
+            bisection_util = 0.0
+            jains_idx = 1.0
+            link_std = 0.0
+
+        # 4. Tỷ lệ rớt gói toàn mạng (Overall Packet Loss Rate %)
+        total_drops = sum(l.get("tx_dropped_delta", 0) for l in link_records)
+        total_bytes_sent = sum(l.get("tx_bytes_delta", 0) for l in link_records)
+        estimated_packets = int(total_bytes_sent / 1000.0) if total_bytes_sent > 0 else 0
+        if (estimated_packets + total_drops) > 0:
+            loss_rate_pct = round((total_drops / float(estimated_packets + total_drops)) * 100.0, 3)
+        else:
+            loss_rate_pct = 0.0
+
+        # 5. Số chặng trung bình & Thời gian hoàn thành luồng chuột (Mice FCT indicator)
+        avg_hop = round(float(np.mean([f["hop_count"] for f in flow_records])), 2) if flow_records else 0.0
+        mice_durs = [f["dur"] for f in flow_records if f["label"] == 0]
+        avg_mice_dur = round(float(np.mean(mice_durs)), 4) if mice_durs else 0.0
+
+        kpi_rec = {
+            "timestamp": now_str,
+            "active_flows_count": active_flows_count,
+            "active_elephant_flows": active_elephant,
+            "active_mice_flows": active_mice,
+            "total_network_throughput_mbps": total_throughput,
+            "bisection_utilization_pct": bisection_util,
+            "overall_packet_loss_rate_pct": loss_rate_pct,
+            "total_network_drops": total_drops,
+            "jains_fairness_index": jains_idx,
+            "link_util_std_dev": link_std,
+            "avg_hop_count": avg_hop,
+            "avg_mice_duration_sec": avg_mice_dur
+        }
+        return kpi_rec
+
+    def _print_dashboard(self, now_str, flow_records, device_records, link_records, kpi_record):
+        """In dashboard trạng thái định kỳ ra màn hình Terminal 3 một cách trực quan."""
+        time_str = now_str.split(" ")[1] if " " in now_str else now_str
+        n_flows = len(flow_records)
+        n_eleph = kpi_record.get("active_elephant_flows", 0) if kpi_record else 0
+        n_mice = kpi_record.get("active_mice_flows", 0) if kpi_record else 0
+        n_nodes = len(device_records)
+        thru = kpi_record.get("total_network_throughput_mbps", 0.0) if kpi_record else 0.0
+        core_util = kpi_record.get("bisection_utilization_pct", 0.0) if kpi_record else 0.0
+        jains = kpi_record.get("jains_fairness_index", 1.0) if kpi_record else 1.0
+        drops = kpi_record.get("total_network_drops", 0) if kpi_record else 0
+
+        print(f"[{time_str}] [Telemetry Poller] Flows: {n_flows:3d} (Voi: {n_eleph:2d}, Chuột: {n_mice:2d}) | Throughput: {thru:6.2f} Mbps | Core-Agg: {core_util:5.1f}% (Jain's: {jains:.3f}) | Nodes: {n_nodes:2d} | Drops: {drops}")
+
+    # ==========================================================================
+    # 6. VÒNG LẶP CHÍNH THU THẬP VÀ GHI DỮ LIỆU ĐỒNG THỜI
+    # ==========================================================================
+    def collect_and_save_all(self):
+        cur_time = time.time()
+        dt = max(cur_time - self.last_time, 0.001)
+        self.last_time = cur_time
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        active_dpids = self.get_active_switches()
+
+        # 1. Thu thập Telemetry Thiết bị (Host Containers & Switches)
+        device_records, health_records, port_stats_by_dpid = self.collect_device_telemetry(active_dpids, now_str, dt)
+        if device_records:
+            pd.DataFrame(device_records).to_csv(self.device_csv, mode="a", header=False, index=False)
+        if health_records:
+            pd.DataFrame(health_records).to_csv(self.health_csv, mode="a", header=False, index=False)
+
+        if not active_dpids:
+            return
+
+        # 2. Cập nhật đồ thị liên kết topo
+        self.update_topology_graph()
+
+        # 3. Thu thập Telemetry Liên kết (Throughput, Utilization %, Drops)
+        link_records = self.collect_link_telemetry(active_dpids, port_stats_by_dpid, now_str, dt)
+        if link_records:
+            pd.DataFrame(link_records).to_csv(self.link_csv, mode="a", header=False, index=False)
+
+        # 4. Đọc Flow Table của tất cả các Switch & Ghép cặp Bi-flow
+        switch_flows_map = {}
+        for dpid in active_dpids:
+            try:
+                resp = requests.get(f"{self.rest_url}/stats/flow/{dpid}", timeout=0.8)
+                if resp.status_code == 200:
+                    switch_flows_map[dpid] = resp.json().get(str(dpid), [])
+            except Exception:
+                switch_flows_map[dpid] = []
+
+        flow_records = self.collect_flow_dataset(active_dpids, switch_flows_map, now_str)
         if flow_records:
             pd.DataFrame(flow_records).to_csv(self.flow_csv, mode="a", header=False, index=False)
 
-        print(f"[{time.strftime('%H:%M:%S')}] Đã ghi: {len(flow_records)} Bi-Flows (10 Features + Full Path) | {len(health_records)} Health Nodes.")
+        # 5. Tính toán và lưu trữ các chỉ số KPI Đánh giá Toàn mạng (Evaluation Benchmarks)
+        kpi_record = self.compute_and_save_kpis(flow_records, link_records, health_records, now_str)
+        if kpi_record:
+            pd.DataFrame([kpi_record]).to_csv(self.kpi_csv, mode="a", header=False, index=False)
+
+        # 6. In Dashboard trạng thái thời gian thực ra màn hình
+        self._print_dashboard(now_str, flow_records, device_records, link_records, kpi_record)
 
 
 def main():
-    collector = EnhancedManagementPlane(RYU_REST_URL, OUTPUT_FLOW_CSV, OUTPUT_HEALTH_CSV)
-    print(f"[*] Management Plane v2 đang chạy (10 Features + Full Hop-by-Hop Paths). Chu kỳ: {POLL_INTERVAL_SEC}s...")
+    collector = ComprehensiveManagementPlane(RYU_REST_URL)
+    print("\n" + "=" * 80)
+    print("[*] TẦNG QUẢN TRỊ & TELEMETRY TOÀN DIỆN (COMPREHENSIVE MANAGEMENT PLANE - v3)")
+    print(f"    - Cổng Ryu REST API : {RYU_REST_URL}")
+    print(f"    - Chu kỳ Polling    : {POLL_INTERVAL_SEC} giây")
+    print(f"    - 1. Dataset AI     : {collector.flow_csv} (10 Features + Hop-by-Hop + Locality)")
+    print(f"    - 2. Giám sát Node  : {collector.device_csv} (CPU %, RAM MB, Net IO)")
+    print(f"    - 3. Giám sát Link  : {collector.link_csv} (Throughput Mbps, Utilization %, Drops)")
+    print(f"    - 4. Benchmark KPIs : {collector.kpi_csv} (Total Throughput, Jain's Fairness, Loss %)")
+    print("=" * 80 + "\n")
+
     try:
         while True:
             collector.collect_and_save_all()
             time.sleep(POLL_INTERVAL_SEC)
     except KeyboardInterrupt:
-        print("\n[+] Đã dừng tầng Management Plane.")
+        print("\n[+] Đã dừng tầng Management Plane an toàn.")
 
 
 if __name__ == "__main__":

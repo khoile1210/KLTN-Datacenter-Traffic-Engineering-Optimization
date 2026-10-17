@@ -1,11 +1,11 @@
-#Host-Dockerfile
-# docker build -t dcn-host:latest .
+# Host-Dockerfile: Xây dựng Docker Host image cho mạng DCN Spine-Leaf
+# Lệnh build: docker build -t dcn-host:latest -f Dockerfile.host .
 FROM ubuntu:22.04
 
 # Tránh các prompt hỏi múi giờ khi cài đặt
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Cài đặt các công cụ mạng cần thiết
+# Cài đặt các công cụ mạng cần thiết cho host phát và nhận lưu lượng
 RUN apt-get update && apt-get install -y \
     iputils-ping \
     iperf \
@@ -16,6 +16,9 @@ RUN apt-get update && apt-get install -y \
     python3 \
     python3-pip \
     python3-scapy \
+    curl \
+    ethtool \
+    procps \
     && rm -rf /var/lib/apt/lists/*
 
 CMD ["/bin/bash"]

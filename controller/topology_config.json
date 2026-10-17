@@ -1,0 +1,131 @@
+{
+  "system_info": {
+    "description": "Cấu hình Topology mạng Datacenter SDN Spine-Leaf Containernet & Quản trị tài nguyên Docker Container",
+    "hardware_reference": {
+      "tor_switch": "Facebook Wedge 40 (Broadcom Trident II BCM56850, 12MB Shared Buffer, 40GbE/10GbE, Intel Atom C2550)",
+      "tor_buffer_mb": 12.0,
+      "cluster_fabric_switch": "Facebook 6-pack Modular Switch (12x Trident II ASICs, 12MB Buffer/ASIC)",
+      "servers": "Facebook OCP Winterfell v3 / Leopard (Dual-socket Intel Xeon E5-2600 v2/v3, 16 Cores, 10GbE NIC, MTU 1500)",
+      "server_physical_cores": 16.0,
+      "server_nic_speed_mbps": 10000.0,
+      "server_mtu_bytes": 1500
+    }
+  },
+  "controller": {
+    "ip": "127.0.0.1",
+    "port": 6653,
+    "protocol": "OpenFlow13"
+  },
+  "switches": {
+    "switch_type": "docker_ovs",
+    "dimage": "dcn-ovs:latest",
+    "core": {
+      "count": 2,
+      "prefix": "c",
+      "dpid_base": "0000000000000020",
+      "model": "Facebook 6-pack (FSW)",
+      "resources": {
+        "cpus": 1.0,
+        "cpu_quota": 100000,
+        "cpu_period": 100000,
+        "cpu_shares": 1024,
+        "mem_limit": "1024m",
+        "memswap_limit": "2048m",
+        "hardware_buffer_mb": 12.0
+      }
+    },
+    "aggregation": {
+      "count": 4,
+      "prefix": "ag",
+      "dpid_base": "0000000000000010",
+      "model": "Facebook 6-pack (CSW)",
+      "resources": {
+        "cpus": 1.0,
+        "cpu_quota": 100000,
+        "cpu_period": 100000,
+        "cpu_shares": 1024,
+        "mem_limit": "1024m",
+        "memswap_limit": "2048m",
+        "hardware_buffer_mb": 12.0
+      }
+    },
+    "access": {
+      "count": 8,
+      "prefix": "a",
+      "dpid_base": "0000000000000000",
+      "model": "Facebook Wedge 40 (ToR / RSW)",
+      "resources": {
+        "cpus": 1.0,
+        "cpu_quota": 100000,
+        "cpu_period": 100000,
+        "cpu_shares": 1024,
+        "mem_limit": "1024m",
+        "memswap_limit": "2048m",
+        "hardware_buffer_mb": 12.0
+      }
+    }
+  },
+  "links": {
+    "bandwidth_mbps": {
+      "core_inet": 100,
+      "core_agg": 100,
+      "agg_access": 50,
+      "access_host": 20.0
+    },
+    "delay": "1ms",
+    "jitter": "0.1ms",
+    "loss_percent": 0.0,
+    "max_queue_size_packets": 1000
+  },
+  "hosts": {
+    "dimage": "dcn-host:latest",
+    "hosts_per_rack": 4,
+    "naming_pattern": "h{rack}_{host}",
+    "ip_prefix": "10.0.0.",
+    "subnet_mask": "/24",
+    "mac_prefix": "00:00:00:00",
+    "mtu_bytes": 1500,
+    "resources": {
+      "cpus": 1.0,
+      "cpu_quota": 100000,
+      "cpu_period": 100000,
+      "cpu_shares": 1024,
+      "mem_limit": "1024m",
+      "memswap_limit": "2048m"
+    },
+    "inet_node": {
+      "name": "inet",
+      "ip": "10.0.0.254/24",
+      "mac": "00:00:00:00:00:99",
+      "default_gw_dev": "inet-eth0",
+      "resources": {
+        "cpus": 1.0,
+        "cpu_quota": 100000,
+        "cpu_period": 100000,
+        "cpu_shares": 1024,
+        "mem_limit": "1024m",
+        "memswap_limit": "2048m"
+      }
+    }
+  },
+  "nfv_proxy": {
+    "enable": true,
+    "port_name": "proxy-int",
+    "subnet_prefix": "10.255.0.",
+    "subnet_mask": "/24"
+  },
+  "device_monitoring_telemetry": {
+    "enabled": true,
+    "stats_interval_sec": 1.0,
+    "metrics_to_collect": [
+      "cpu_percent",
+      "memory_usage_mb",
+      "memory_limit_mb",
+      "network_rx_bytes",
+      "network_tx_bytes",
+      "packet_drop_count"
+    ],
+    "output_csv": "results/device_resource_utilization.csv",
+    "note": "Cho phép đo đạc chính xác mức độ sử dụng tài nguyên (CPU %, RAM MB) của từng Switch và Host container."
+  }
+}

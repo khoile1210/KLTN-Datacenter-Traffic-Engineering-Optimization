@@ -25,25 +25,30 @@ def create_spine_leaf_topology():
         l = net.addSwitch(f'l{i}', cls=OVSSwitch, protocols='OpenFlow13')
         leaves.append(l)
 
-    info('*** Thêm các Docker Hosts và công cụ mạng\n')
-    hosts = []
+    info('*** Thêm các Docker Hosts và công cụ mạng (Mặc định 1 rack = 4 hosts)\n')
+    hosts = {}
     for i in range(1, 5):
-        h = net.addDocker(f'h{i}', ip=f'10.0.0.{i}/24', dimage="sdn-host:latest")
-        hosts.append(h)
+        for h in range(1, 5):
+            h_name = f'h{i}_{h}'
+            idx = (i - 1) * 4 + h
+            hosts[h_name] = net.addDocker(h_name, ip=f'10.0.0.{idx}/24', dimage="dcn-host:latest")
 
-    # Thêm h0 (đóng vai trò Guest từ Internet)
-    h0 = net.addDocker(f'h0', ip=f'10.0.0.10/24', dimage="sdn-host:latest")
+    # Thêm inet (đóng vai trò Guest từ Internet)
+    inet = net.addDocker('inet', ip='10.0.0.100/24', dimage="dcn-host:latest")
 
     info('*** Tạo liên kết (Links) giữa Spine và Leaf (Full Mesh)\n')
     for spine in spines:
-        net.addLink(spine, h0, cls=TCLink, bw=200, delay='10ms', loss=0.5, max_queue_size=1000)
+        net.addLink(spine, inet, cls=TCLink, bw=200, delay='10ms', loss=0.5, max_queue_size=1000)
         
         for leaf in leaves:
             net.addLink(spine, leaf, cls=TCLink, bw=1000, delay='0.1ms', loss=0, max_queue_size=5000)
 
-    info('*** Tạo liên kết giữa Host và Leaf\n')
-    for i in range(4):
-        net.addLink(hosts[i], leaves[i], cls=TCLink, bw=100, delay='1ms', loss=0, max_queue_size=1000)
+    info('*** Tạo liên kết giữa Host và Leaf (Mỗi Leaf nối 4 hosts)\n')
+    for i in range(1, 5):
+        leaf = leaves[i - 1]
+        for h in range(1, 5):
+            h_name = f'h{i}_{h}'
+            net.addLink(hosts[h_name], leaf, cls=TCLink, bw=100, delay='1ms', loss=0, max_queue_size=1000)
     
 
     info('*** Khởi động mạng SDN\n')

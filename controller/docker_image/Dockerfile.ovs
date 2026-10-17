@@ -1,5 +1,5 @@
-# Dockerfile xây dựng Docker OVS Switch nhúng NFV Proxy
-# docker build -t dcn-ovs:latest -f Dockerfile.ovs .
+# Switch-Dockerfile: Xây dựng Docker OVS Switch nhúng NFV Proxy
+# Lệnh build: docker build -t dcn-ovs:latest -f Dockerfile.ovs .
 FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive

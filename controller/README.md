@@ -92,12 +92,24 @@ pip3 install numpy pandas matplotlib seaborn
 ### Build Docker Images
 
 ```bash
-# 1. Build image Docker Host (dcn-host:latest)
-docker build -t dcn-host:latest -f Dockerfile .
+# Sử dụng script tự động trong controller/docker_image:
+cd controller/docker_image
+./build_images.sh
 
-# 2. Build image Docker OVS Switch nhúng NFV Proxy (dcn-ovs:latest)
+# Hoặc build thủ công từng image:
+docker build -t dcn-host:latest -f Dockerfile.host .
 docker build -t dcn-ovs:latest -f Dockerfile.ovs .
+cd ..
 ```
+
+### Topology Architecture (Mặc định: 1 Rack = 4 Hosts)
+- **Core Switches (2)**: `c1`, `c2` (Facebook 6-pack FSW).
+- **Aggregation Switches (4)**: `ag1` -> `ag4` (Facebook 6-pack CSW).
+- **Access Switches (8)**: `a1` -> `a8` đại diện cho 8 tủ Rack (Facebook Wedge 40 RSW).
+- **Docker Hosts (32 nội bộ + 1 Internet)**:
+  - Mỗi tủ Rack có 4 Hosts: `h{rack}_{host}` (`h1_1..h1_4` đến `h8_1..h8_4`).
+  - IP: `10.0.0.1` đến `10.0.0.32` (Subnet mask `/24`).
+  - Node Internet ngoài DCN: `inet` (`10.0.0.100/24`).
 
 ### Run
 
@@ -105,7 +117,7 @@ docker build -t dcn-ovs:latest -f Dockerfile.ovs .
 # Terminal 1: Run Controller (Ryu OF1.3)
 ryu-manager --observe-links controller.py ryu.app.ofctl_rest ryu.app.rest_topology --ofp-tcp-listen-port 6653
 
-# Terminal 2: Run Topology Spine-Leaf
+# Terminal 2: Run Topology Spine-Leaf (Containernet 32 Hosts)
 sudo python3 spine_leaf_topo.py
 
 (containernet>) pingall

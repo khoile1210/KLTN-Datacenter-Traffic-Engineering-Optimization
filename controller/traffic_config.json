@@ -1,0 +1,44 @@
+{
+  "system_info": {
+    "description": "Cấu hình mô hình phụ tải lưu lượng Facebook DCN (ACM SIGCOMM 2015) & Thuật toán lấy mẫu toán học",
+    "reference_topology_file": "topology_config.json",
+    "note": "Các thông số dùng chung với topology được tham chiếu trực tiếp bằng cú pháp ref:<file>#/<json_path> để đảm bảo tính nhất quán tuyệt đối."
+  },
+  "bandwidth_scaling": {
+    "C_host_mbps": "ref:topology_config.json#/links/bandwidth_mbps/access_host",
+    "C_paper_mbps": "ref:topology_config.json#/system_info/hardware_reference/server_nic_speed_mbps",
+    "note": "Tỷ số co giãn alpha = C_host / C_paper (tự động tính dựa trên giá trị tham chiếu từ topology_config.json)."
+  },
+  "cpu_time_dilation": {
+    "CPU_host_cores": "ref:topology_config.json#/hosts/resources/cpus",
+    "CPU_paper_cores": "ref:topology_config.json#/system_info/hardware_reference/server_physical_cores",
+    "note": "Hệ số giãn nhịp D_arrival = CPU_paper / CPU_host (tự động đồng bộ số core cấp cho host từ topology_config.json)."
+  },
+  "flow_threshold": {
+    "S_threshold_bytes": 124225,
+    "note": "Ngưỡng phân tách luồng Voi/Chuột. Cập nhật tự động sau phân tích Pareto P90."
+  },
+  "destination_locality": {
+    "r_intra_rack": 0.072,
+    "r_extra_rack": 0.85,
+    "r_extra_dc": 0.078,
+    "note": "Phân bổ 3 vùng theo Bảng 3 bài báo Facebook: 7.2% cùng rack, 85.0% xuyên rack DCN, 7.8% ra ngoài Internet (node inet)."
+  },
+  "microburst_settings": {
+    "p_burst": 0.02,
+    "burst_size_min_bytes": 20480,
+    "burst_size_max_bytes": 81920,
+    "target_duration_ms_max": 10.0,
+    "note": "Cấu hình bơm Heavy Jitter / Microburst kiểm thử hàng đợi switch (microburst_generator.py)."
+  },
+  "network_runtime": {
+    "iperf_ports": [
+      5201,
+      5202,
+      5203,
+      5204
+    ],
+    "min_sleep_sec": 0.01,
+    "max_concurrency_per_host": 20
+  }
+}

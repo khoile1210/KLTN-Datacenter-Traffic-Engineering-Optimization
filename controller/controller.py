@@ -11,6 +11,8 @@ Mô tả   : Ryu Controller OpenFlow 1.3 chuyên dụng cho Multi-tier Spine-Lea
 Chạy    : ryu-manager --observe-links controller.py ryu.app.ofctl_rest ryu.app.rest_topology --ofp-tcp-listen-port 6653
 """
 
+import os
+import json
 from ryu import cfg
 from ryu.base import app_manager
 from ryu.controller import ofp_event
@@ -39,12 +41,40 @@ class MultiTierEcmpController(app_manager.RyuApp):
         self.datapaths = {}
 
         # Danh bạ Host động (IP -> {mac, dpid, port})
-        # Khởi tạo mặc định cho 8 host nội bộ và host inet làm điểm xuất phát
-        self.host_db = {
-            f"10.0.0.{i}": {"mac": f"00:00:00:00:00:0{i}", "dpid": i, "port": 5}
-            for i in range(1, 9)
-        }
-        self.host_db["10.0.0.100"] = {"mac": "00:00:00:00:00:99", "dpid": 33, "port": 1}
+        # Khởi tạo mặc định cho các host nội bộ (1 rack = 4 hosts) và host inet
+        config_path = os.path.join(os.path.dirname(__file__), "topology_config.json")
+        num_access = 8
+        hosts_per_rack = 4
+        num_agg = 4
+        cfg_data = {}
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, "r", encoding="utf-8") as f:
+                    cfg_data = json.load(f)
+                    num_access = int(cfg_data.get("switches", {}).get("access", {}).get("count", 8))
+                    num_agg = int(cfg_data.get("switches", {}).get("aggregation", {}).get("count", 4))
+                    hosts_per_rack = int(cfg_data.get("hosts", {}).get("hosts_per_rack", 4))
+            except Exception:
+                pass
+
+        self.host_db = {}
+        for r in range(1, num_access + 1):
+            for h in range(1, hosts_per_rack + 1):
+                host_num = (r - 1) * hosts_per_rack + h
+                self.host_db[f"10.0.0.{host_num}"] = {
+                    "mac": f"00:00:00:00:{r:02x}:{h:02x}",
+                    "dpid": r,
+                    "port": num_agg + h
+                }
+
+        # Đọc động thông tin node Internet từ topology_config.json (10.0.0.254, cắm vào Core switch c1 - DPID 33, Port 1)
+        inet_cfg = cfg_data.get("hosts", {}).get("inet_node", {})
+        inet_raw_ip = inet_cfg.get("ip", "10.0.0.254/24")
+        inet_ip = inet_raw_ip.split("/")[0]
+        inet_mac = inet_cfg.get("mac", "00:00:00:00:00:99")
+        self.host_db[inet_ip] = {"mac": inet_mac, "dpid": 33, "port": 1}
+        if inet_ip != "10.0.0.100":
+            self.host_db["10.0.0.100"] = {"mac": inet_mac, "dpid": 33, "port": 1}
 
         self.group_id_map = {ip: idx + 1 for idx, ip in enumerate(self.host_db.keys())}
         self.installed_groups = set()     # Lưu tập hợp (dpid, group_id)
@@ -75,11 +105,6 @@ class MultiTierEcmpController(app_manager.RyuApp):
         self.installed_groups = {item for item in self.installed_groups if item[0] != dpid}
         self.installed_biflows = {item for item in self.installed_biflows if item[0] != dpid}
 
-        # Cài luật Table-Miss chuyển gói lạ lên Controller (Priority 0)
-        match = parser.OFPMatch()
-        actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
-        self.add_flow(datapath, priority=0, match=match, actions=actions)
-
         # Xóa các Group Table cũ còn tồn đọng trên switch phần cứng
         del_mod = parser.OFPGroupMod(
             datapath=datapath,
@@ -89,7 +114,35 @@ class MultiTierEcmpController(app_manager.RyuApp):
         )
         datapath.send_msg(del_mod)
 
-        # Cài đặt ngay luật chuyển tiếp cục bộ cho các Host cắm trực tiếp vào switch này
+        # ======================================================================
+        # CẤU HÌNH MULTI-TABLE PIPELINE (OPENFLOW 1.3):
+        # Table 0: Phân loại luồng, Proxy ARP, Bắt 5-tuple Ingress Header (128 bytes)
+        # Table 1: Bảng định tuyến phần cứng FIB & Cân bằng tải ECMP Group Table
+        # ======================================================================
+
+        # 1. Table 0 - Priority 200: Cô lập gói tin ARP chuyển thẳng lên Controller để Proxy ARP xử lý
+        m_arp = parser.OFPMatch(eth_type=ether.ETH_TYPE_ARP)
+        self.add_flow(datapath, priority=200, match=m_arp, actions=[parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)], table_id=0)
+
+        # 2. Table 0 - Priority 50: Bắt luồng mới từ cổng cắm Host (Access Switch)
+        # Chỉ sao chép tối đa 128 bytes header lên Controller (chống nghẽn control plane)
+        # và NGAY LẬP TỨC chuyển tiếp sang Table 1 để xử lý forwarding, không làm trễ hay mất gói
+        host_ports = [info["port"] for ip, info in self.host_db.items() if info["dpid"] == dpid]
+        for hp in host_ports:
+            m_hp = parser.OFPMatch(in_port=hp, eth_type=ether.ETH_TYPE_IP)
+            inst_hp = [
+                parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, 128)]),
+                parser.OFPInstructionGotoTable(1)
+            ]
+            self.add_flow(datapath, priority=50, match=m_hp, actions=[], instructions=inst_hp, table_id=0)
+
+        # 3. Table 0 - Priority 0: Mặc định Table 0 -> Chuyển tiếp sang Table 1
+        self.add_flow(datapath, priority=0, match=parser.OFPMatch(), actions=[], instructions=[parser.OFPInstructionGotoTable(1)], table_id=0)
+
+        # 4. Table 1 - Priority 0: Table-Miss Table 1 -> Gửi lên Controller (LLDP link discovery, v.v.)
+        self.add_flow(datapath, priority=0, match=parser.OFPMatch(), actions=[parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)], table_id=1)
+
+        # 5. Cài đặt luật chuyển tiếp cục bộ cho các Host cắm trực tiếp vào switch này (vào Table 1)
         self.install_local_host_rules(dpid)
 
         # Yêu cầu thống kê cổng để phát hiện số hiệu cổng 'proxy-int' nếu có
@@ -115,18 +168,17 @@ class MultiTierEcmpController(app_manager.RyuApp):
             if info["dpid"] == dpid:
                 host_port = info["port"]
                 m_ip = parser.OFPMatch(eth_type=ether.ETH_TYPE_IP, ipv4_dst=ip)
-                self.add_flow(datapath, priority=100, match=m_ip, actions=[parser.OFPActionOutput(host_port)])
-                m_arp = parser.OFPMatch(eth_type=ether.ETH_TYPE_ARP, arp_tpa=ip)
-                self.add_flow(datapath, priority=100, match=m_arp, actions=[parser.OFPActionOutput(host_port)])
-                self.logger.info(f"[+] Cài luật cục bộ trên Switch DPID={dpid} cho Host {ip} -> Port {host_port}")
+                self.add_flow(datapath, priority=100, match=m_ip, actions=[parser.OFPActionOutput(host_port)], table_id=1)
+                self.logger.info(f"[+] Cài luật cục bộ trên Switch DPID={dpid} (Table 1) cho Host {ip} -> Port {host_port}")
 
-    def add_flow(self, datapath, priority, match, actions, instructions=None, idle_timeout=0, hard_timeout=0):
+    def add_flow(self, datapath, priority, match, actions, instructions=None, idle_timeout=0, hard_timeout=0, table_id=0):
         parser = datapath.ofproto_parser
         ofproto = datapath.ofproto
         if instructions is None:
             instructions = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
         mod = parser.OFPFlowMod(
             datapath=datapath,
+            table_id=table_id,
             priority=priority,
             match=match,
             instructions=instructions,
@@ -184,6 +236,18 @@ class MultiTierEcmpController(app_manager.RyuApp):
             self.install_local_host_rules(dpid)
             self.install_ecmp_for_single_host(ip)
 
+            # Cài bổ sung luật bắt Table 0 Priority 50 cho host_port mới
+            datapath = self.datapaths.get(dpid)
+            if datapath:
+                parser = datapath.ofproto_parser
+                ofproto = datapath.ofproto
+                m_hp = parser.OFPMatch(in_port=in_port, eth_type=ether.ETH_TYPE_IP)
+                inst_hp = [
+                    parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, 128)]),
+                    parser.OFPInstructionGotoTable(1)
+                ]
+                self.add_flow(datapath, priority=50, match=m_hp, actions=[], instructions=inst_hp, table_id=0)
+
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
         msg = ev.msg
@@ -210,7 +274,7 @@ class MultiTierEcmpController(app_manager.RyuApp):
                     self.send_arp_reply(datapath, in_port, eth.src, src_ip, target_mac, dst_ip)
             return
 
-        # 3.2. Xử lý gói tin IPv4: On-demand routing + Cài đặt 5-tuple Bi-flow
+        # 3.2. Xử lý gói tin IPv4: Cài đặt 5-tuple Bi-flow đối xứng trên cả Ingress và Egress Switch
         ip_pkt = pkt.get_protocol(ipv4.ipv4)
         if ip_pkt:
             src_ip = ip_pkt.src
@@ -218,28 +282,36 @@ class MultiTierEcmpController(app_manager.RyuApp):
             proto = ip_pkt.proto
             self.learn_host(src_ip, eth.src, dpid, in_port)
 
-            if dst_ip in self.host_db:
+            # Bóc tách cổng L4 nếu là TCP hoặc UDP
+            src_port = 0
+            dst_port = 0
+            tcp_pkt = pkt.get_protocol(tcp.tcp)
+            udp_pkt = pkt.get_protocol(udp.udp)
+            if tcp_pkt:
+                src_port = tcp_pkt.src_port
+                dst_port = tcp_pkt.dst_port
+            elif udp_pkt:
+                src_port = udp_pkt.src_port
+                dst_port = udp_pkt.dst_port
+
+            if src_port > 0 and dst_port > 0:
+                # FAST IN-MEMORY DEDUP: Kiểm tra xem cặp 5-tuple đã được cài đặt chưa
+                biflow_signature = tuple(sorted([(src_ip, src_port), (dst_ip, dst_port)])) + (proto,)
+                if biflow_signature in self.installed_biflows:
+                    return
+                self.installed_biflows.add(biflow_signature)
+
                 # Đảm bảo đã có ECMP group cho dst_ip
                 if (dpid, self.group_id_map.get(dst_ip, 0)) not in self.installed_groups:
                     self.install_ecmp_for_single_host(dst_ip)
 
-                # Bóc tách cổng L4 nếu là TCP hoặc UDP
-                src_port = 0
-                dst_port = 0
-                tcp_pkt = pkt.get_protocol(tcp.tcp)
-                udp_pkt = pkt.get_protocol(udp.udp)
-                if tcp_pkt:
-                    src_port = tcp_pkt.src_port
-                    dst_port = tcp_pkt.dst_port
-                elif udp_pkt:
-                    src_port = udp_pkt.src_port
-                    dst_port = udp_pkt.dst_port
+                # Cài đặt cặp Flow Rule 5-tuple đối xứng tại Table 0 trên CẢ Ingress và Egress Switch
+                self.install_symmetric_biflow(datapath, dpid, src_ip, dst_ip, src_port, dst_port, proto)
 
-                # Cài đặt cặp Flow Rule 5-tuple đối xứng (Bi-flow) tại Ingress Access Switch
-                if src_port > 0 and dst_port > 0:
-                    self.install_symmetric_biflow(datapath, dpid, in_port, src_ip, dst_ip, src_port, dst_port, proto)
-
-                # Đẩy gói tin đầu tiên đi tiếp an toàn bằng Packet-Out
+            # Do Table 0 Priority 50 đã có Instruction GotoTable(1), các gói tin bình thường đã được chuyển tiếp
+            # trực tiếp trong datapath sang Table 1 mà không cần controller PacketOut (tránh trùng lặp).
+            # Chỉ trường hợp gói tin đến từ Table-Miss Table 1 (gói lạ) mới cần chuyển tiếp qua PacketOut.
+            if getattr(msg, 'table_id', 0) == 1 and dst_ip in self.host_db:
                 target_dpid = self.host_db[dst_ip]["dpid"]
                 if dpid == target_dpid:
                     out_port = self.host_db[dst_ip]["port"]
@@ -262,44 +334,33 @@ class MultiTierEcmpController(app_manager.RyuApp):
                 )
                 datapath.send_msg(out)
 
-    def install_symmetric_biflow(self, datapath, dpid, in_port, src_ip, dst_ip, src_port, dst_port, proto):
-        """Cài đặt cặp luật 5-tuple đối xứng tại Ingress Switch để OVS đếm riêng chiều đi và chiều về."""
-        biflow_key = (dpid, src_ip, dst_ip, src_port, dst_port, proto)
-        if biflow_key in self.installed_biflows:
-            return
+    def install_symmetric_biflow(self, ingress_dp, ingress_dpid, src_ip, dst_ip, src_port, dst_port, proto):
+        """Cài đặt cặp luật 5-tuple đối xứng tại Table 0 trên CẢ Ingress Switch và Egress Switch để OVS đếm riêng 2 chiều."""
+        target_switches = [(ingress_dpid, ingress_dp)]
 
-        parser = datapath.ofproto_parser
-        ofproto = datapath.ofproto
-        group_id = self.group_id_map.get(dst_ip)
-        if not group_id:
-            return
+        egress_dpid = self.host_db.get(dst_ip, {}).get("dpid")
+        if egress_dpid and egress_dpid != ingress_dpid and egress_dpid in self.datapaths:
+            target_switches.append((egress_dpid, self.datapaths[egress_dpid]))
 
-        # 1. Forward Rule (Chiều đi: src -> dst): Đẩy vào ECMP Group (hoặc output host nếu cùng switch)
-        target_dpid = self.host_db.get(dst_ip, {}).get("dpid")
-        if dpid == target_dpid:
-            fwd_actions = [parser.OFPActionOutput(self.host_db[dst_ip]["port"])]
-            fwd_inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, fwd_actions)]
-        else:
-            fwd_inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, [parser.OFPActionGroup(group_id)])]
+        for sw_dpid, dp in target_switches:
+            parser = dp.ofproto_parser
 
-        # 2. Backward Rule (Chiều về: dst -> src): Đẩy ra cổng cắm host nguồn
-        bwd_actions = [parser.OFPActionOutput(in_port)]
-        bwd_inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, bwd_actions)]
+            if proto == inet.IPPROTO_TCP:
+                m_fwd = parser.OFPMatch(eth_type=ether.ETH_TYPE_IP, ip_proto=proto, ipv4_src=src_ip, ipv4_dst=dst_ip, tcp_src=src_port, tcp_dst=dst_port)
+                m_bwd = parser.OFPMatch(eth_type=ether.ETH_TYPE_IP, ip_proto=proto, ipv4_src=dst_ip, ipv4_dst=src_ip, tcp_src=dst_port, tcp_dst=src_port)
+            elif proto == inet.IPPROTO_UDP:
+                m_fwd = parser.OFPMatch(eth_type=ether.ETH_TYPE_IP, ip_proto=proto, ipv4_src=src_ip, ipv4_dst=dst_ip, udp_src=src_port, udp_dst=dst_port)
+                m_bwd = parser.OFPMatch(eth_type=ether.ETH_TYPE_IP, ip_proto=proto, ipv4_src=dst_ip, ipv4_dst=src_ip, udp_src=dst_port, udp_dst=src_port)
+            else:
+                continue
 
-        # Tạo match chi tiết theo TCP hoặc UDP
-        if proto == inet.IPPROTO_TCP:
-            m_fwd = parser.OFPMatch(eth_type=ether.ETH_TYPE_IP, ip_proto=proto, ipv4_src=src_ip, ipv4_dst=dst_ip, tcp_src=src_port, tcp_dst=dst_port)
-            m_bwd = parser.OFPMatch(eth_type=ether.ETH_TYPE_IP, ip_proto=proto, ipv4_src=dst_ip, ipv4_dst=src_ip, tcp_src=dst_port, tcp_dst=src_port)
-        elif proto == inet.IPPROTO_UDP:
-            m_fwd = parser.OFPMatch(eth_type=ether.ETH_TYPE_IP, ip_proto=proto, ipv4_src=src_ip, ipv4_dst=dst_ip, udp_src=src_port, udp_dst=dst_port)
-            m_bwd = parser.OFPMatch(eth_type=ether.ETH_TYPE_IP, ip_proto=proto, ipv4_src=dst_ip, ipv4_dst=src_ip, udp_src=dst_port, udp_dst=src_port)
-        else:
-            return
+            # Tại Table 0: Chuyển tiếp thẳng sang Table 1 để xử lý định tuyến FIB/ECMP mà không cần qua Controller
+            fwd_inst = [parser.OFPInstructionGotoTable(1)]
+            bwd_inst = [parser.OFPInstructionGotoTable(1)]
 
-        # Cài đặt với Priority=150 (ưu tiên hơn luật ECMP mặc định Priority=100) và idle_timeout=30s
-        self.add_flow(datapath, priority=150, match=m_fwd, actions=[], instructions=fwd_inst, idle_timeout=30)
-        self.add_flow(datapath, priority=150, match=m_bwd, actions=[], instructions=bwd_inst, idle_timeout=30)
-        self.installed_biflows.add(biflow_key)
+            # Cài đặt với Priority=150 (cao hơn Priority=50 và Priority=0 của Table 0) và idle_timeout=30s
+            self.add_flow(dp, priority=150, match=m_fwd, actions=[], instructions=fwd_inst, idle_timeout=30, table_id=0)
+            self.add_flow(dp, priority=150, match=m_bwd, actions=[], instructions=bwd_inst, idle_timeout=30, table_id=0)
 
     def send_arp_reply(self, datapath, port, dst_mac, dst_ip, src_mac, src_ip):
         pkt = packet.Packet()
@@ -382,7 +443,7 @@ class MultiTierEcmpController(app_manager.RyuApp):
                     [parser.OFPActionGroup(group_id=group_id)]
                 )
             ]
-            self.add_flow(datapath, priority=100, match=match_ip, actions=[], instructions=instructions)
+            self.add_flow(datapath, priority=100, match=match_ip, actions=[], instructions=instructions, table_id=1)
 
     def install_all_ecmp_paths(self):
         for dst_ip in list(self.host_db.keys()):
@@ -411,6 +472,6 @@ class MultiTierEcmpController(app_manager.RyuApp):
             return False
 
         actions = [parser.OFPActionOutput(proxy_port)]
-        self.add_flow(datapath, priority=1000, match=match, actions=actions, idle_timeout=60)
+        self.add_flow(datapath, priority=1000, match=match, actions=actions, idle_timeout=60, table_id=0)
         self.logger.info(f"[STEER] Luồng Voi {src_ip}:{src_port} -> {dst_ip}:{dst_port} trên DPID={src_dpid} đã được điều hướng vào proxy-int (Port {proxy_port})!")
         return True
