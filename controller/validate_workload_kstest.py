@@ -25,13 +25,14 @@ if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
 if sys.stderr and hasattr(sys.stderr, 'reconfigure'):
     sys.stderr.reconfigure(encoding='utf-8')
 
+import argparse
+
 RESULTS_DIR = os.path.join(os.path.dirname(__file__), "..", "results")
 if not os.path.exists(RESULTS_DIR):
     RESULTS_DIR = os.path.join(os.path.dirname(__file__), "results")
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
 PROFILES_DIR = os.path.join(os.path.dirname(__file__), "cdf_profiles")
-CHART_OUTPUT_PATH = os.path.join(RESULTS_DIR, "chart_facebook_workload_validation.png")
 DATASET_PATH = os.path.join(RESULTS_DIR, "final_labeled_flow_dataset.csv")
 if not os.path.exists(DATASET_PATH):
     DATASET_PATH = os.path.join(RESULTS_DIR, "traffic_flow_dataset_with_paths.csv")
@@ -47,8 +48,18 @@ def load_unified_cdf(filename):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Academic Kolmogorov-Smirnov (KS-Test) Validation")
+    parser.add_argument("-o", "--output-dir", default=RESULTS_DIR, help="Directory to save output chart and validation report")
+    args = parser.parse_args()
+
+    output_dir = args.output_dir
+    os.makedirs(output_dir, exist_ok=True)
+    chart_output_path = os.path.join(output_dir, "chart_facebook_workload_validation.png")
+    report_output_path = os.path.join(output_dir, "ks_test_results.txt")
+
     print("\n" + "=" * 80)
     print(" GIAI ĐOẠN 8: KIỂM ĐỊNH THỐNG KÊ HỌC THUẬT (KS-TEST & OVERLAY VALIDATION)")
+    print(f"[*] Thư mục lưu kết quả: {output_dir}")
     print("=" * 80)
 
     # 1. Nạp dữ liệu thực nghiệm từ Dataset
@@ -148,10 +159,22 @@ def main():
     plt.suptitle("KIỂM ĐỊNH TÍNH TƯƠNG ĐỒNG LƯU LƯỢNG MẠNG DATACENTER (FACEBOOK ACM SIGCOMM 2015)",
                  fontsize=14, fontweight="bold", y=1.02)
     plt.tight_layout()
-    plt.savefig(CHART_OUTPUT_PATH, dpi=300, bbox_inches="tight")
+    plt.savefig(chart_output_path, dpi=300, bbox_inches="tight")
     plt.close()
 
-    print(f"\n[+] Đã xuất biểu đồ đối soát chất lượng cao (300 DPI): {CHART_OUTPUT_PATH}")
+    # Lưu báo cáo text
+    with open(report_output_path, "w", encoding="utf-8") as f:
+        f.write("KẾT QUẢ KIỂM ĐỊNH 2 MẪU KOLMOGOROV-SMIRNOV (TWO-SAMPLE KS-TEST)\n")
+        f.write("=" * 70 + "\n")
+        f.write(f"1. Phân phối Flow Size:\n")
+        f.write(f"   - KS Statistic (D) : {ks_fs_res.statistic:.4f}\n")
+        f.write(f"   - p-value          : {ks_fs_res.pvalue:.4e}\n")
+        f.write(f"2. Phân phối Flow Duration:\n")
+        f.write(f"   - KS Statistic (D) : {ks_fd_res.statistic:.4f}\n")
+        f.write(f"   - p-value          : {ks_fd_res.pvalue:.4e}\n")
+
+    print(f"\n[+] Đã xuất biểu đồ đối soát chất lượng cao (300 DPI): {chart_output_path}")
+    print(f"[+] Đã xuất báo cáo thống kê: {report_output_path}")
     print("[V] Hoàn tất toàn diện Giai đoạn 8 (Validation & Academic Reporting)!\n")
 
 

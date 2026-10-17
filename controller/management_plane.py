@@ -38,6 +38,15 @@ import psutil
 import threading
 from datetime import datetime
 
+# Tích hợp hạ tầng eBPF / XDP High-Resolution Telemetry Engine
+try:
+    from ebpf_loader import get_ebpf_manager
+except ImportError:
+    try:
+        from controller.ebpf_loader import get_ebpf_manager
+    except ImportError:
+        get_ebpf_manager = None
+
 # Đảm bảo UTF-8
 if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8')
@@ -253,6 +262,14 @@ class ComprehensiveManagementPlane:
         # Khởi tạo và kích hoạt Background Collector cho Docker stats (Zero-timeout, Non-blocking)
         self.docker_collector = DockerStatsCollectorThread(poll_interval=2.0, timeout=8.0)
         self.docker_collector.start()
+
+        # Khởi tạo hạ tầng eBPF / XDP High-Resolution Telemetry Engine (Tự động thích ứng Fallback 3 Tầng)
+        self.ebpf_manager = get_ebpf_manager() if get_ebpf_manager else None
+        if self.ebpf_manager and self.ebpf_manager.is_active:
+            try:
+                self.ebpf_manager.attach_mininet_interfaces()
+            except Exception:
+                pass
 
     def _load_topology_config(self):
         """Nạp các thông số hạ tầng phần cứng và băng thông mở từ topology_config.json."""
@@ -764,7 +781,20 @@ class ComprehensiveManagementPlane:
             sw_tx_mbps = round((sw_delta_tx_b * 8.0) / (dt * 1e6), 3)
             sw_rx_mbps = round((sw_delta_rx_b * 8.0) / (dt * 1e6), 3)
 
+            # Đo đạc PPS: Tận dụng số liệu vi mô từ eBPF Kernel nếu sẵn sàng, nếu không dùng delta OpenFlow
             pps = round((sw_delta_tx_p + sw_delta_rx_p) / dt, 2)
+            if self.ebpf_manager and self.ebpf_manager.is_active:
+                try:
+                    dpid_int = int(str(dpid).lstrip("0") or "0", 16) if isinstance(dpid, str) else int(dpid)
+                    k_stats = self.ebpf_manager.get_kernel_switch_stats(dpid_int)
+                    if k_stats and k_stats.get("rx_packets", 0) > 0:
+                        k_pkts = k_stats["rx_packets"]
+                        prev_k = self.last_port_stats.get((dpid, "KERNEL_PKTS"), (time.time() - dt, k_pkts))
+                        delta_k_pkts = max(k_pkts - prev_k[1], 0)
+                        pps = round(delta_k_pkts / dt, 2)
+                        self.last_port_stats[(dpid, "KERNEL_PKTS")] = (time.time(), k_pkts)
+                except Exception:
+                    pass
             self.last_port_stats[(dpid, "TOTAL")] = (time.time(), tx_bytes, rx_bytes, tx_pkts, rx_pkts, tx_dropped, errors)
 
             sw_metrics[dpid] = {
@@ -1215,6 +1245,8 @@ def main():
     print(f"    - 2. Giám sát Node  : {collector.device_csv} (CPU %, RAM MB, Net IO)")
     print(f"    - 3. Giám sát Link  : {collector.link_csv} (Throughput Mbps, Utilization %, Drops)")
     print(f"    - 4. Benchmark KPIs : {collector.kpi_csv} (Total Throughput, Jain's Fairness, Loss %)")
+    ebpf_status = collector.ebpf_manager.active_tier if collector.ebpf_manager else "Disabled (No eBPF module)"
+    print(f"    - 5. eBPF Engine    : {ebpf_status}")
     print("=" * 80 + "\n")
 
     try:
@@ -1222,7 +1254,11 @@ def main():
             collector.collect_and_save_all()
             time.sleep(POLL_INTERVAL_SEC)
     except KeyboardInterrupt:
-        print("\n[+] Đã dừng tầng Management Plane an toàn.")
+        if collector.ebpf_manager:
+            collector.ebpf_manager.cleanup()
+        if hasattr(collector, 'docker_collector'):
+            collector.docker_collector.stop()
+        print("\n[+] Đã dừng tầng Management Plane và giải phóng eBPF/Docker threads an toàn.")
 
 
 if __name__ == "__main__":

@@ -257,12 +257,14 @@ sudo python3 controller/spine_leaf_topo.py
 
 ```bash
 cd ~/dcn
-python3 controller/management_plane.py
+
+# Khuyến nghị: Chạy với sudo để mở khóa Tier 1 eBPF / XDP Kernel Telemetry (hoặc không cần sudo cho Tier 3 Fallback)
+sudo python3 controller/management_plane.py
 ```
 
 **Dấu hiệu thành công:**
 
-- Terminal hiển thị banner khởi tạo 4 tệp tin CSV chuyên biệt:
+- Terminal hiển thị banner khởi tạo 4 tệp tin CSV chuyên biệt và trạng thái động cơ eBPF:
 
   ```
   [+] Khởi tạo file Dataset luồng (10 Features): results/traffic_flow_dataset_with_paths.csv
@@ -279,6 +281,7 @@ python3 controller/management_plane.py
       - 2. Giám sát Node  : results/device_resource_utilization.csv (CPU %, RAM MB, Net IO)
       - 3. Giám sát Link  : results/link_utilization_telemetry.csv (Throughput Mbps, Utilization %, Drops)
       - 4. Benchmark KPIs : results/network_evaluation_kpis.csv (Total Throughput, Jain's Fairness, Loss %)
+      - 5. eBPF Engine    : Tier 1: Full High-Res eBPF/XDP + Perf Ring Buffer
   ================================================================================
   ```
 
@@ -435,6 +438,7 @@ Bạn có thể chọn **1 trong 2 cách tổ chức** tùy theo thói quen:
 ---
 
 #### CÁCH 1 (Khuyên Dùng): Chỉ cần 01 session `tmux` duy nhất chứa 5 Cửa Sổ (Tabs)
+
 Bạn không cần mở nhiều tmux riêng lẻ, mà quản lý 5 terminal tương tự như 5 tab trình duyệt bên trong 1 phiên:
 
 1. **Khởi tạo session duy nhất:**
@@ -442,34 +446,35 @@ Bạn không cần mở nhiều tmux riêng lẻ, mà quản lý 5 terminal tư�
    tmux new -s dcn_sim
    ```
 2. **Thao tác tạo và chuyển đổi giữa 5 Terminal (Tabs):**
-   * **Tạo tab mới:** Bấm **`Ctrl + B`** rồi ấn phím **`C`** (Create Window).
-   * **Đổi tên tab cho dễ nhớ:** Bấm **`Ctrl + B`** rồi ấn phím **`,`** (nhập tên: `ryu`, `topo`, `mgmt`, `traffic`, `burst`).
-   * **Chuyển qua lại các tab:**
-     * Bấm **`Ctrl + B`** rồi ấn phím số **`0`**, **`1`**, **`2`**, **`3`**, **`4`** để nhảy ngay tới terminal tương ứng.
-     * Hoặc **`Ctrl + B`** rồi ấn phím **`N`** (Next) / **`P`** (Previous).
-   * *Khởi chạy lần lượt (tất cả đều đứng tại thư mục `~/dcn`):*
+   - **Tạo tab mới:** Bấm **`Ctrl + B`** rồi ấn phím **`C`** (Create Window).
+   - **Đổi tên tab cho dễ nhớ:** Bấm **`Ctrl + B`** rồi ấn phím **`,`** (nhập tên: `ryu`, `topo`, `mgmt`, `traffic`, `burst`).
+   - **Chuyển qua lại các tab:**
+     - Bấm **`Ctrl + B`** rồi ấn phím số **`0`**, **`1`**, **`2`**, **`3`**, **`4`** để nhảy ngay tới terminal tương ứng.
+     - Hoặc **`Ctrl + B`** rồi ấn phím **`N`** (Next) / **`P`** (Previous).
+   - _Khởi chạy lần lượt (tất cả đều đứng tại thư mục `~/dcn`):_
      - **Tab 0 (`ryu`):** `ryu-manager --observe-links controller/controller.py ryu.app.ofctl_rest ryu.app.rest_topology --ofp-tcp-listen-port 6653`
      - **Tab 1 (`topo`):** `sudo python3 controller/spine_leaf_topo.py` (chờ ổn định rồi gõ `pingall`)
      - **Tab 2 (`mgmt`):** `python3 controller/management_plane.py`
      - **Tab 3 (`traffic`):** `sudo python3 controller/traffic_generator.py --duration 1h`
-      - **Tab 4 (`burst`):** `sudo python3 controller/microburst_generator.py --mode random --duration 1h --mininterval 10s --maxinterval 30s`
+     - **Tab 4 (`burst`):** `sudo python3 controller/microburst_generator.py --mode random --duration 1h --mininterval 10s --maxinterval 30s`
 3. **Treo máy & Thoát SSH an toàn (Detach):**
-   * Nhấn tổ hợp phím: **`Ctrl + B`**, sau đó thả tay ra và nhấn phím **`D`** (Detach).
-   * Màn hình hiển thị: `[detached (from session dcn_sim)]`.
-   * **Bây giờ bạn có thể tắt máy tính cá nhân, ngắt kết nối SSH thoải mái.** Cả 5 tab vẫn tiếp tục chạy ngầm 100% trên máy chủ ảo.
+   - Nhấn tổ hợp phím: **`Ctrl + B`**, sau đó thả tay ra và nhấn phím **`D`** (Detach).
+   - Màn hình hiển thị: `[detached (from session dcn_sim)]`.
+   - **Bây giờ bạn có thể tắt máy tính cá nhân, ngắt kết nối SSH thoải mái.** Cả 5 tab vẫn tiếp tục chạy ngầm 100% trên máy chủ ảo.
 
 ---
 
 #### CÁCH 2 (Dễ Nhớ Cho Người Mới): Mỗi Terminal là 01 session `tmux` riêng biệt
+
 Nếu bạn quen mở nhiều cửa sổ SSH độc lập (tất cả đều đứng tại `cd ~/dcn`), bạn có thể tạo 5 session riêng biệt:
 
-* **Terminal 1 (Ryu):** `tmux new -s ryu` $\to$ `ryu-manager --observe-links controller/controller.py ryu.app.ofctl_rest ryu.app.rest_topology --ofp-tcp-listen-port 6653` $\to$ Bấm `Ctrl+B, D`.
-* **Terminal 2 (Topo):** `tmux new -s topo` $\to$ `sudo python3 controller/spine_leaf_topo.py` & gõ `pingall` $\to$ Bấm `Ctrl+B, D`.
-* **Terminal 3 (Mgmt):** `tmux new -s mgmt` $\to$ `python3 controller/management_plane.py` $\to$ Bấm `Ctrl+B, D`.
-* **Terminal 4 (Traffic):** `tmux new -s traffic` $\to$ `sudo python3 controller/traffic_generator.py --duration 1h` $\to$ Bấm `Ctrl+B, D`.
-* **Terminal 5 (Burst):** `tmux new -s burst` $\to$ `sudo python3 controller/microburst_generator.py --mode random --duration 1h --mininterval 10s --maxinterval 30s` $\to$ Bấm `Ctrl+B, D`.
+- **Terminal 1 (Ryu):** `tmux new -s ryu` $\to$ `ryu-manager --observe-links controller/controller.py ryu.app.ofctl_rest ryu.app.rest_topology --ofp-tcp-listen-port 6653` $\to$ Bấm `Ctrl+B, D`.
+- **Terminal 2 (Topo):** `tmux new -s topo` $\to$ `sudo python3 controller/spine_leaf_topo.py` & gõ `pingall` $\to$ Bấm `Ctrl+B, D`.
+- **Terminal 3 (Mgmt):** `tmux new -s mgmt` $\to$ `python3 controller/management_plane.py` $\to$ Bấm `Ctrl+B, D`.
+- **Terminal 4 (Traffic):** `tmux new -s traffic` $\to$ `sudo python3 controller/traffic_generator.py --duration 1h` $\to$ Bấm `Ctrl+B, D`.
+- **Terminal 5 (Burst):** `tmux new -s burst` $\to$ `sudo python3 controller/microburst_generator.py --mode random --duration 1h --mininterval 10s --maxinterval 30s` $\to$ Bấm `Ctrl+B, D`.
 
-*Khi SSH vào lại, muốn xem terminal nào chỉ cần gõ:* `tmux attach -t traffic` hoặc `tmux attach -t mgmt`. (Gõ `tmux ls` để liệt kê danh sách toàn bộ session).
+_Khi SSH vào lại, muốn xem terminal nào chỉ cần gõ:_ `tmux attach -t traffic` hoặc `tmux attach -t mgmt`. (Gõ `tmux ls` để liệt kê danh sách toàn bộ session).
 
 ---
 
