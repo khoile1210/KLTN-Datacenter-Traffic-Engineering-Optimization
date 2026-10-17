@@ -130,18 +130,8 @@ class UnifiedCdfSampler:
         self.u_fd = self.df_duration["cdf"].values
         self.log_v_fd = np.log10(np.maximum(self.df_duration["value"].values, 1e-6))
 
-    def sample_flow_size(self):
-        """
-        Lấy mẫu kích thước luồng (Bytes):
-        1. Nghịch đảo lấy mẫu trên log-scale: u ~ Uniform(0, 1) -> s_paper (Bytes)
-        2. Co giãn phi tuyến chống nghịch đảo:
-           Nếu có s_threshold: S_scaled = s nếu s <= s_th else s_th + (s - s_th) * alpha
-           Nếu không (null): S_scaled = s_paper
-        """
-        u = random.uniform(0.001, 0.999)
-        log_s = np.interp(u, self.u_fs, self.log_v_fs)
-        s_paper = 10.0 ** log_s
-
+    def scale_flow_size(self, s_paper):
+        """Co giãn phi tuyến kích thước luồng theo mô hình Piecewise Continuous Scaling."""
         if self.s_threshold is not None and self.s_threshold > 0:
             if s_paper <= self.s_threshold:
                 s_scaled = s_paper
@@ -149,9 +139,18 @@ class UnifiedCdfSampler:
                 s_scaled = self.s_threshold + (s_paper - self.s_threshold) * self.alpha
         else:
             s_scaled = s_paper
+        return max(int(round(s_scaled)), 64)
 
-        # Kích thước tối thiểu là 64 Bytes (chuẩn Ethernet frame)
-        s_scaled = max(int(round(s_scaled)), 64)
+    def sample_flow_size(self):
+        """
+        Lấy mẫu kích thước luồng (Bytes):
+        1. Nghịch đảo lấy mẫu trên log-scale: u ~ Uniform(0, 1) -> s_paper (Bytes)
+        2. Co giãn phi tuyến chống nghịch đảo qua scale_flow_size()
+        """
+        u = random.uniform(0.001, 0.999)
+        log_s = np.interp(u, self.u_fs, self.log_v_fs)
+        s_paper = 10.0 ** log_s
+        s_scaled = self.scale_flow_size(s_paper)
         return int(round(s_paper)), s_scaled
 
     def sample_inter_arrival(self):

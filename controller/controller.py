@@ -13,6 +13,7 @@ Chạy    : ryu-manager --observe-links controller.py ryu.app.ofctl_rest ryu.app
 
 import os
 import json
+import time
 from ryu import cfg
 from ryu.base import app_manager
 from ryu.controller import ofp_event
@@ -78,7 +79,7 @@ class MultiTierEcmpController(app_manager.RyuApp):
 
         self.group_id_map = {ip: idx + 1 for idx, ip in enumerate(self.host_db.keys())}
         self.installed_groups = set()     # Lưu tập hợp (dpid, group_id)
-        self.installed_biflows = set()    # Lưu tập hợp (dpid, src_ip, dst_ip, src_port, dst_port, proto)
+        self.installed_biflows = {}       # Lưu ánh xạ biflow_signature -> timestamp cài đặt (TTL 35s)
 
         # Quản lý Debounce Timer chống bão FlowMod khi LLDP phát hiện link dồn dập
         self.topology_debounce_timer = None
@@ -103,7 +104,7 @@ class MultiTierEcmpController(app_manager.RyuApp):
         # VÁ LỖI QUAN TRỌNG: Xóa sạch trạng thái installed_groups của DPID này trong RAM Controller
         # để đảm bảo khi Switch kết nối lại, lệnh GroupMod gửi xuống luôn là OFPGC_ADD
         self.installed_groups = {item for item in self.installed_groups if item[0] != dpid}
-        self.installed_biflows = {item for item in self.installed_biflows if item[0] != dpid}
+        self.installed_biflows.clear()
 
         # Xóa các Group Table cũ còn tồn đọng trên switch phần cứng
         del_mod = parser.OFPGroupMod(
@@ -295,11 +296,13 @@ class MultiTierEcmpController(app_manager.RyuApp):
                 dst_port = udp_pkt.dst_port
 
             if src_port > 0 and dst_port > 0:
-                # FAST IN-MEMORY DEDUP: Kiểm tra xem cặp 5-tuple đã được cài đặt chưa
+                # FAST IN-MEMORY DEDUP WITH TTL: Kiểm tra xem cặp 5-tuple đã được cài đặt trong 35s qua chưa
                 biflow_signature = tuple(sorted([(src_ip, src_port), (dst_ip, dst_port)])) + (proto,)
+                now_ts = time.time()
                 if biflow_signature in self.installed_biflows:
-                    return
-                self.installed_biflows.add(biflow_signature)
+                    if now_ts - self.installed_biflows[biflow_signature] < 35.0:
+                        return
+                self.installed_biflows[biflow_signature] = now_ts
 
                 # Đảm bảo đã có ECMP group cho dst_ip
                 if (dpid, self.group_id_map.get(dst_ip, 0)) not in self.installed_groups:

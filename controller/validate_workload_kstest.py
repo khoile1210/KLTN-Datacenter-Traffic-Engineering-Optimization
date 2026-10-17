@@ -27,6 +27,11 @@ if sys.stderr and hasattr(sys.stderr, 'reconfigure'):
 
 import argparse
 
+try:
+    from unified_sampler import UnifiedCdfSampler
+except ImportError:
+    from controller.unified_sampler import UnifiedCdfSampler
+
 RESULTS_DIR = os.path.join(os.path.dirname(__file__), "..", "results")
 if not os.path.exists(RESULTS_DIR):
     RESULTS_DIR = os.path.join(os.path.dirname(__file__), "results")
@@ -75,21 +80,25 @@ def main():
     exp_sbytes = df_exp["sbytes"].dropna().values
     exp_dur = df_exp["dur"].dropna().values
 
-    # 2. Nạp dữ liệu lý thuyết từ Facebook ECDF
+    # 2. Nạp dữ liệu lý thuyết từ Facebook ECDF và chuẩn hóa theo hệ quy chiếu Similitude (20 Mbps)
     fb_fs_val, fb_fs_cdf = load_unified_cdf("cdf_flow_size_unified.csv")
     fb_fd_val, fb_fd_cdf = load_unified_cdf("cdf_flow_duration_unified.csv")
+
+    sampler = UnifiedCdfSampler()
+    scaled_fb_fs_val = np.array([sampler.scale_flow_size(v) for v in fb_fs_val])
 
     # Sinh mẫu kiểm định từ Facebook CDF bằng phương pháp Inverse Transform
     num_test_samples = min(len(df_exp), 5000)
     u_random = np.random.uniform(0.001, 0.999, size=num_test_samples)
 
     log_fb_fs = np.log10(np.maximum(fb_fs_val, 1.0))
-    sampled_fb_fs = 10.0 ** np.interp(u_random, fb_fs_cdf, log_fb_fs)
+    raw_sampled_fb_fs = 10.0 ** np.interp(u_random, fb_fs_cdf, log_fb_fs)
+    sampled_fb_fs = np.array([sampler.scale_flow_size(s) for s in raw_sampled_fb_fs])
 
     log_fb_fd = np.log10(np.maximum(fb_fd_val, 1e-4))
     sampled_fb_fd = 10.0 ** np.interp(u_random, fb_fd_cdf, log_fb_fd)
 
-    # 3. Thực hiện kiểm định 2 mẫu Kolmogorov-Smirnov (KS-Test)
+    # 3. Thực hiện kiểm định 2 mẫu Kolmogorov-Smirnov (KS-Test trên cùng hệ quy chiếu)
     # 3.1. Flow Size KS-Test
     ks_fs_res = stats.ks_2samp(exp_sbytes, sampled_fb_fs)
     # 3.2. Flow Duration KS-Test
@@ -117,7 +126,7 @@ def main():
 
     # 4. Vẽ biểu đồ so sánh chồng hình (Overlay Comparison Plot)
     sns.set_theme(style="whitegrid", font="sans-serif")
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    fig, axes = plt.subplots(1, 2, figsize=(15, 6))
 
     # Đồ thị 1: Flow Size ECDF Overlay
     ax1 = axes[0]
@@ -125,9 +134,11 @@ def main():
     sort_exp_fs = np.sort(exp_sbytes)
     ecdf_exp_fs = np.arange(1, len(sort_exp_fs) + 1) / len(sort_exp_fs)
 
-    ax1.plot(fb_fs_val, fb_fs_cdf, label="Facebook Unified ECDF (Bài báo gốc)",
-             color="#e74c3c", linestyle="--", linewidth=2.8)
-    ax1.plot(sort_exp_fs, ecdf_exp_fs, label=f"Mininet/Containernet Emulation (N={len(sort_exp_fs):,})",
+    ax1.plot(fb_fs_val, fb_fs_cdf, label="Facebook Raw (10 Gbps gốc)",
+             color="#7f8c8d", linestyle=":", linewidth=1.8, alpha=0.7)
+    ax1.plot(scaled_fb_fs_val, fb_fs_cdf, label="Facebook Target Scaled (20 Mbps mục tiêu)",
+             color="#e74c3c", linestyle="--", linewidth=2.5)
+    ax1.plot(sort_exp_fs, ecdf_exp_fs, label=f"Containernet Emulation (N={len(sort_exp_fs):,})",
              color="#2980b9", linestyle="-", linewidth=2.0, alpha=0.9)
 
     ax1.set_xscale("log")
@@ -144,8 +155,8 @@ def main():
     ecdf_exp_fd = np.arange(1, len(sort_exp_fd) + 1) / len(sort_exp_fd)
 
     ax2.plot(fb_fd_val, fb_fd_cdf, label="Facebook Unified Duration (Lý thuyết)",
-             color="#e67e22", linestyle="--", linewidth=2.8)
-    ax2.plot(sort_exp_fd, ecdf_exp_fd, label=f"Mininet Thực Nghiệm (FCT tự nhiên)",
+             color="#e67e22", linestyle="--", linewidth=2.5)
+    ax2.plot(sort_exp_fd, ecdf_exp_fd, label=f"Containernet Thực Nghiệm (True FCT)",
              color="#27ae60", linestyle="-", linewidth=2.0, alpha=0.9)
 
     ax2.set_xscale("log")

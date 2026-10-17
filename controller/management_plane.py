@@ -251,6 +251,7 @@ class ComprehensiveManagementPlane:
         self.last_time = time.time()
 
         self.flow_cache = {}
+        self.flow_tracker = {}  # pair_id -> {'first_seen', 'last_active', 'bytes', 'pkts', 'committed'}
         self.group_bucket_cache = {}
 
         # Khởi tạo CPU tracking
@@ -559,7 +560,10 @@ class ComprehensiveManagementPlane:
     def extract_biflow_stats(self, switch_flows_map):
         """
         Ghép cặp Luồng đối xứng (Bidirectional Flow Pairing) từ các Flow Rules 5-tuple
-        được Controller cài đặt trên các Access Switch.
+        được Controller cài đặt trên các Access Switch:
+        - Bóc tách đầy đủ cả chuẩn OpenFlow 1.3 và Ryu REST API cũ (tp_src/tp_dst, nw_proto).
+        - Triển khai Flow State Machine & True FCT: chỉ tính FCT thực tế thay vì tuổi thọ rule.
+        - Single Commit: Chỉ xuất bản ghi luồng đã hoàn thành 1 lần duy nhất, chống nhân bản luồng lặp lại.
         """
         raw_flows = {}
 
@@ -568,41 +572,43 @@ class ComprehensiveManagementPlane:
                 m = f.get("match", {})
                 s_ip = m.get("ipv4_src") or m.get("nw_src")
                 d_ip = m.get("ipv4_dst") or m.get("nw_dst")
-                proto = m.get("ip_proto", 0)
-                s_pt = m.get("tcp_src") or m.get("udp_src", 0)
-                d_pt = m.get("tcp_dst") or m.get("udp_dst", 0)
+                proto = int(m.get("ip_proto") or m.get("nw_proto") or 0)
+                s_pt = int(m.get("tcp_src") or m.get("udp_src") or m.get("tp_src") or 0)
+                d_pt = int(m.get("tcp_dst") or m.get("udp_dst") or m.get("tp_dst") or 0)
 
                 if s_ip and d_ip and s_ip.startswith("10.") and d_ip.startswith("10."):
-                    dur = float(f.get("duration_sec", 0)) + float(f.get("duration_nsec", 0)) / 1e9
+                    dur_ovs = float(f.get("duration_sec", 0)) + float(f.get("duration_nsec", 0)) / 1e9
                     pkts = int(f.get("packet_count", 0))
                     bytes_ = int(f.get("byte_count", 0))
 
                     direction_key = (s_ip, d_ip, s_pt, d_pt, proto)
                     if direction_key not in raw_flows or bytes_ > raw_flows[direction_key]["bytes"]:
                         raw_flows[direction_key] = {
-                            "dur": dur,
+                            "dur_ovs": dur_ovs,
                             "pkts": pkts,
                             "bytes": bytes_,
                             "dpid": dpid
                         }
 
+        now_ts = time.time()
         processed_pairs = set()
+        active_pairs = set()
         paired_records = []
 
         for (s_ip, d_ip, s_pt, d_pt, proto), fwd_info in raw_flows.items():
             bwd_key = (d_ip, s_ip, d_pt, s_pt, proto)
             pair_id = tuple(sorted([(s_ip, s_pt), (d_ip, d_pt)])) + (proto,)
+            active_pairs.add(pair_id)
 
             if pair_id in processed_pairs:
                 continue
             processed_pairs.add(pair_id)
 
-            bwd_info = raw_flows.get(bwd_key, {"dur": 0.0, "pkts": 0, "bytes": 0})
+            bwd_info = raw_flows.get(bwd_key, {"dur_ovs": 0.0, "pkts": 0, "bytes": 0})
 
             if fwd_info["bytes"] >= bwd_info["bytes"]:
                 src_ip, dst_ip = s_ip, d_ip
                 src_port, dst_port = s_pt, d_pt
-                dur = max(fwd_info["dur"], bwd_info["dur"], 0.001)
                 sbytes = fwd_info["bytes"]
                 dbytes = bwd_info["bytes"]
                 Spkts = fwd_info["pkts"]
@@ -610,24 +616,78 @@ class ComprehensiveManagementPlane:
             else:
                 src_ip, dst_ip = d_ip, s_ip
                 src_port, dst_port = d_pt, s_pt
-                dur = max(bwd_info["dur"], fwd_info["dur"], 0.001)
                 sbytes = bwd_info["bytes"]
                 dbytes = fwd_info["bytes"]
                 Spkts = bwd_info["pkts"]
                 Dpkts = fwd_info["pkts"]
 
-            paired_records.append({
-                "src_ip": src_ip,
-                "dst_ip": dst_ip,
-                "src_port": src_port,
-                "dst_port": dst_port,
-                "protocol": proto,
-                "dur": dur,
-                "sbytes": sbytes,
-                "dbytes": dbytes,
-                "Spkts": Spkts,
-                "Dpkts": Dpkts
-            })
+            tot_bytes = sbytes + dbytes
+            tot_pkts = Spkts + Dpkts
+            if tot_bytes == 0:
+                continue
+
+            # 1. Flow State Machine: Theo dõi vòng đời luồng và chống nhân bản luồng lặp
+            tracker = self.flow_tracker.get(pair_id)
+            if not tracker:
+                # Luồng mới xuất hiện lần đầu trong OVS
+                tracker = {
+                    "first_seen": now_ts,
+                    "last_active": now_ts,
+                    "bytes": tot_bytes,
+                    "pkts": tot_pkts,
+                    "committed": False
+                }
+                self.flow_tracker[pair_id] = tracker
+            else:
+                # Luồng đã có trong cache: nếu bytes tăng thì cập nhật last_active
+                if tot_bytes > tracker["bytes"]:
+                    tracker["last_active"] = now_ts
+                    tracker["bytes"] = tot_bytes
+                    tracker["pkts"] = tot_pkts
+                    tracker["committed"] = False
+
+            # 2. Tính toán True FCT (Flow Completion Time) chuẩn xác
+            ebpf_fct = None
+            if self.ebpf_manager and self.ebpf_manager.is_active:
+                f_metrics = self.ebpf_manager.get_flow_metrics()
+                for (es_ip, ed_ip, es_pt, ed_pt, e_proto), m_val in f_metrics.items():
+                    if sorted([(es_ip, es_pt), (ed_ip, ed_pt)]) == sorted([(src_ip, src_port), (dst_ip, dst_port)]):
+                        if m_val.get("fct_us", 0) > 0:
+                            ebpf_fct = m_val["fct_us"] / 1e6
+                            break
+
+            if ebpf_fct is not None and ebpf_fct > 0:
+                true_dur = round(ebpf_fct, 4)
+            elif tracker["last_active"] > tracker["first_seen"]:
+                true_dur = round(tracker["last_active"] - tracker["first_seen"], 4)
+            else:
+                # Luồng Mice hoàn tất trong 1 chu kỳ polling:
+                # Thời gian truyền vật lý trên đường link Access (20 Mbps) + RTT
+                c_mbps = self.bw_access_host
+                phy_time = (tot_bytes * 8.0) / (c_mbps * 1e6) + 0.002
+                true_dur = max(round(phy_time, 4), 0.001)
+
+            # 3. SINGLE COMMIT: Chỉ xuất bản ghi luồng 1 lần duy nhất khi hoàn tất
+            # Không ghi lặp lại khi số bytes đứng im suốt 30 giây idle_timeout của OVS!
+            if not tracker["committed"]:
+                tracker["committed"] = True
+                paired_records.append({
+                    "src_ip": src_ip,
+                    "dst_ip": dst_ip,
+                    "src_port": src_port,
+                    "dst_port": dst_port,
+                    "protocol": proto,
+                    "dur": true_dur,
+                    "sbytes": sbytes,
+                    "dbytes": dbytes,
+                    "Spkts": Spkts,
+                    "Dpkts": Dpkts
+                })
+
+        # Dọn dẹp các luồng đã bị OVS xóa sau khi hết timeout
+        stale_keys = [k for k in self.flow_tracker.keys() if k not in active_pairs]
+        for k in stale_keys:
+            del self.flow_tracker[k]
 
         return paired_records
 

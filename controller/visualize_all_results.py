@@ -404,6 +404,14 @@ def main():
     plot_link_utilization()
     plot_network_kpis()
     plot_microbursts()
+
+    # Chạy kiểm định thống kê học thuật KS-Test và lưu biểu đồ vào TARGET_DIR
+    kstest_script = os.path.join(os.path.dirname(__file__), "validate_workload_kstest.py")
+    if os.path.exists(kstest_script):
+        import subprocess
+        print("[*] Đang thực thi validate_workload_kstest.py...")
+        subprocess.run([sys.executable, kstest_script, "-o", TARGET_DIR])
+
     create_summary_report()
     
     print("\n[V] Hoàn tất toàn bộ biểu đồ trực quan hóa dữ liệu thực nghiệm!")

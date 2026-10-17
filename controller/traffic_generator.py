@@ -106,17 +106,29 @@ def exec_in_container(container_name, command, is_background=True, wait_timeout=
             return None
 
 
-def start_iperf_servers(host_dict, iperf_ports):
+ENGINE_PATH = os.path.join(os.path.dirname(__file__), "dcn_flow_engine.py")
+
+
+def start_flow_servers(host_dict, iperf_ports):
     """
-    Khởi động iperf3 server đa cổng trên toàn bộ các container:
-    1. Dọn dẹp sạch tiến trình iperf3 cũ trên toàn bộ host đồng thời.
-    2. Bật daemon iperf3 server trên từng cổng (5201-5204).
+    Khởi động DCN Flow Engine Server đa luồng và iperf3 fallback trên toàn bộ các container:
+    1. Dọn dẹp sạch tiến trình cũ trên toàn bộ host đồng thời.
+    2. Sao chép dcn_flow_engine.py vào /tmp/ của từng container.
+    3. Bật daemon Flow Server siêu nhẹ (hỗ trợ hàng nghìn kết nối đồng thời, không nghẽn).
     """
-    print(f"[*] Dọn dẹp tiến trình cũ và khởi động iperf3 server đa cổng {iperf_ports}...")
+    ports_str = ",".join(map(str, iperf_ports))
+    print(f"[*] Phổ biến DCN Flow Engine và khởi động server đa cổng [{ports_str}] trên {len(host_dict)} containers...")
     procs = []
     for h_name, h_info in host_dict.items():
-        cmd = f"docker exec {h_info['container_name']} killall -9 iperf3 2>/dev/null"
-        procs.append(subprocess.Popen(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+        c_name = h_info['container_name']
+        # Dọn dẹp sạch tiến trình cũ
+        cmd_clean = f"docker exec {c_name} pkill -f dcn_flow_engine.py 2>/dev/null; docker exec {c_name} killall -9 iperf3 2>/dev/null"
+        procs.append(subprocess.Popen(cmd_clean, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+        
+        # Sao chép dcn_flow_engine.py vào container nếu có
+        if os.path.exists(ENGINE_PATH):
+            subprocess.run(f"docker cp \"{ENGINE_PATH}\" {c_name}:/tmp/dcn_flow_engine.py", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            
     for p in procs:
         try:
             p.wait(timeout=2)
@@ -124,22 +136,28 @@ def start_iperf_servers(host_dict, iperf_ports):
             pass
 
     for h_name, h_info in host_dict.items():
+        c_name = h_info["container_name"]
+        # Khởi chạy Flow Server chính
+        exec_in_container(c_name, f"python3 /tmp/dcn_flow_engine.py --server -p {ports_str}", is_background=True)
+        # Khởi chạy iperf3 dự phòng
         for p in iperf_ports:
-            exec_in_container(h_info["container_name"], f"iperf3 -s -p {p} -B {h_info['ip']} -D", is_background=True)
+            exec_in_container(c_name, f"iperf3 -s -p {p} -B {h_info['ip']} -D", is_background=True)
+
     time.sleep(1.5)
-    print(f"[+] Toàn bộ iperf3 servers ({len(host_dict)} hosts x {len(iperf_ports)} ports) đã sẵn sàng.")
+    print(f"[+] Toàn bộ Flow Servers ({len(host_dict)} hosts x {len(iperf_ports)} ports) đã sẵn sàng.")
 
 
 def cleanup_traffic_processes(host_dict):
     """
-    Dọn dẹp triệt để 100% các tiến trình iperf3 (cả client và server) bên trong container:
+    Dọn dẹp triệt để 100% các tiến trình sinh tải (Flow Engine và iperf3) bên trong container:
     Thực thi song song trên toàn bộ 33 container và chờ hoàn tất (.wait())
     trước khi thoát, đảm bảo không còn tiến trình rác chạy ngầm bắn trộm traffic.
     """
-    print("\n[*] Đang dọn dẹp triệt để các tiến trình iperf3 trên toàn bộ container...")
+    print("\n[*] Đang dọn dẹp triệt để các tiến trình sinh tải trên toàn bộ container...")
     procs = []
     for h_name, h_info in host_dict.items():
-        cmd = f"docker exec {h_info['container_name']} killall -9 iperf3 2>/dev/null"
+        c_name = h_info['container_name']
+        cmd = f"docker exec {c_name} pkill -f dcn_flow_engine.py 2>/dev/null; docker exec {c_name} killall -9 iperf3 2>/dev/null"
         p = subprocess.Popen(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         procs.append(p)
 
@@ -148,7 +166,7 @@ def cleanup_traffic_processes(host_dict):
             p.wait(timeout=3)
         except Exception:
             pass
-    print("[+] Hoàn tất dọn dẹp. Mọi tiến trình iperf3 đã được giải phóng an toàn.")
+    print("[+] Hoàn tất dọn dẹp. Mọi tiến trình sinh tải đã được giải phóng an toàn.")
 
 
 def parse_duration_arg(val):
@@ -197,7 +215,7 @@ def main():
         sys.exit(1)
 
     sampler = UnifiedCdfSampler(config_path=args.config)
-    start_iperf_servers(hosts, sampler.iperf_ports)
+    start_flow_servers(hosts, sampler.iperf_ports)
 
     # Danh sách các host nội bộ tham gia phát sinh luồng
     internal_hosts = [h for h in hosts.keys() if h != "inet"]
@@ -263,10 +281,9 @@ def main():
             if flow_count % 10 == 0 or s_scaled >= 50000:
                 print(f"[{time.strftime('%H:%M:%S')}] [#{flow_count:,} | {elapsed_min:.1f}m] [{zone:<10}] {src_name} ({src_info['ip']}) -> {dst_name} ({dst_info['ip']}) | Port: {port} | Size: {s_scaled:,.0f} B (raw: {s_raw:,.0f} B) | Sleep: {dt_scaled*1000:.1f}ms")
 
-            # 6. Phát luồng TCP đồng nhất bằng iperf3 -n
-            # Dùng -n để truyền đúng số bytes mẫu, để mạng tự quyết định FCT và thông lượng
-            iperf_cmd = f"iperf3 -c {dst_info['ip']} -p {port} -B {src_info['ip']} -n {s_scaled}"
-            exec_in_container(src_info["container_name"], iperf_cmd, is_background=True)
+            # 6. Phát luồng TCP đồng nhất bằng Precise DCN Flow Engine (kết nối đơn, chuẩn từng byte)
+            flow_cmd = f"python3 /tmp/dcn_flow_engine.py --client -d {dst_info['ip']} -p {port} -b {s_scaled} -B {src_info['ip']}"
+            exec_in_container(src_info["container_name"], flow_cmd, is_background=True)
 
             # 7. Nghỉ đúng khoảng thời gian giãn nhịp ECDF
             time.sleep(dt_scaled)
