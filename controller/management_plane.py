@@ -36,6 +36,7 @@ import pandas as pd
 import networkx as nx
 import psutil
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 # Tích hợp hạ tầng eBPF / XDP High-Resolution Telemetry Engine
@@ -66,11 +67,7 @@ OUTPUT_HEALTH_CSV = os.path.join(RESULTS_DIR, "system_and_network_health.csv")
 OUTPUT_LINK_CSV = os.path.join(RESULTS_DIR, "link_utilization_telemetry.csv")
 OUTPUT_KPI_CSV = os.path.join(RESULTS_DIR, "network_evaluation_kpis.csv")
 
-POLL_INTERVAL_SEC = 1.0
-
-# Ngưỡng phân loại Ground Truth cho luồng Voi (Elephant Flow)
-ELEPHANT_BYTE_RATE_THRESHOLD = 1024 * 1024       # 1 MB/s (Sload > 1 MB/s)
-ELEPHANT_TOTAL_BYTES_THRESHOLD = 5 * 1024 * 1024 # 5 MB (sbytes > 5 MB)
+POLL_INTERVAL_SEC = 0.5
 
 # ==============================================================================
 # ĐỊNH NGHĨA CẤU TRÚC TIÊU ĐỀ CSV CHO 4 BỘ METRICS
@@ -89,12 +86,12 @@ DEVICE_CSV_HEADERS = [
     "timestamp", "node_name", "node_type", "cpu_percent",
     "memory_usage_mb", "memory_limit_mb", "memory_percent",
     "network_rx_bytes", "network_tx_bytes", "network_rx_mbps", "network_tx_mbps",
-    "packet_drop_count", "tcam_entries"
+    "packet_drop_count", "tcam_entries", "tcam_usage_pct"
 ]
 
 HEALTH_CSV_HEADERS = [
     "timestamp", "node_name", "node_type", "cpu_usage_pct", "ram_used_mb",
-    "ram_limit_mb", "ram_usage_pct", "tcam_entries", "total_tx_bytes", "total_rx_bytes",
+    "ram_limit_mb", "ram_usage_pct", "tcam_entries", "tcam_usage_pct", "total_tx_bytes", "total_rx_bytes",
     "tx_mbps", "rx_mbps", "total_tx_dropped", "total_rx_dropped", "total_errors"
 ]
 
@@ -242,6 +239,16 @@ class ComprehensiveManagementPlane:
 
         self.topo_graph = nx.DiGraph()
 
+        # Khởi tạo Persistent HTTP Session với Connection Pooling (Keep-Alive)
+        self.session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=1)
+        self.session.mount("http://", adapter)
+        self.session.mount("https://", adapter)
+
+        # Bộ nhớ đệm tạm thời theo chu kỳ cho Group Table
+        self._cycle_group_desc = {}
+        self._cycle_group_stats = {}
+
         # Nạp cấu hình từ topology_config.json
         self._load_topology_config()
 
@@ -295,6 +302,7 @@ class ComprehensiveManagementPlane:
                     self.num_access = int(sw_cfg.get("access", {}).get("count", 8))
                     self.num_agg = int(sw_cfg.get("aggregation", {}).get("count", 4))
                     self.num_core = int(sw_cfg.get("core", {}).get("count", 2))
+                    self.tcam_capacity_rules = int(sw_cfg.get("tcam_capacity_rules", 1000))
 
                     hosts_cfg = cfg_data.get("hosts", {})
                     self.hosts_per_rack = int(hosts_cfg.get("hosts_per_rack", 4))
@@ -302,22 +310,51 @@ class ComprehensiveManagementPlane:
                     self.inet_ip = raw_inet.split("/")[0]
 
                     bw_cfg = cfg_data.get("links", {}).get("bandwidth_mbps", {})
-                    self.bw_core_inet = float(bw_cfg.get("core_inet", 100.0))
-                    self.bw_core_agg = float(bw_cfg.get("core_agg", 100.0))
-                    self.bw_agg_access = float(bw_cfg.get("agg_access", 50.0))
-                    self.bw_access_host = float(bw_cfg.get("access_host", 20.0))
+                    self.bw_core_inet = float(bw_cfg.get("core_inet", 200.0))
+                    self.bw_core_agg = float(bw_cfg.get("core_agg", 200.0))
+                    self.bw_agg_access = float(bw_cfg.get("agg_access", 100.0))
+                    self.bw_access_host = float(bw_cfg.get("access_host", 100.0))
+
+                    self.clusters_cfg = cfg_data.get("clusters", {})
+                    self.is_clustered = self.clusters_cfg.get("enabled", False)
             except Exception as e:
                 print(f"[!] Cảnh báo nạp cấu hình: {e}. Sử dụng cấu hình mặc định.")
+                self.clusters_cfg = {}
+                self.is_clustered = False
+        else:
+            self.clusters_cfg = {}
+            self.is_clustered = False
 
-        # Xây dựng danh bạ ánh xạ IP -> Switch DPID và Port cắm (1 rack = hosts_per_rack)
+        # Đọc cấu hình ngưỡng từ traffic_config.json
+        traffic_cfg_path = os.path.join(os.path.dirname(__file__), "traffic_config.json")
+        self.s_threshold_bytes = None
+        if os.path.exists(traffic_cfg_path):
+            try:
+                with open(traffic_cfg_path, "r", encoding="utf-8") as tf:
+                    tcfg = json.load(tf)
+                    self.s_threshold_bytes = tcfg.get("flow_threshold", {}).get("S_threshold_bytes")
+            except Exception:
+                pass
+
+        # Xây dựng danh bạ ánh xạ IP -> Switch DPID và Port cắm (Cluster-Aware)
         self.host_switch_map = {}
         self.host_port_map = {}
         for r in range(1, self.num_access + 1):
+            uplinks_count = self.num_agg
+            if self.is_clustered:
+                for cl_key in ["cluster_1", "cluster_2"]:
+                    cl_info = self.clusters_cfg.get(cl_key, {})
+                    racks = cl_info.get("racks", [])
+                    access_names = cl_info.get("access_switches", [])
+                    if r in racks or f"a{r}" in access_names:
+                        uplinks_count = len(cl_info.get("aggregation_switches", []))
+                        break
+
             for h in range(1, self.hosts_per_rack + 1):
                 idx = (r - 1) * self.hosts_per_rack + h
                 ip = f"10.0.0.{idx}"
                 self.host_switch_map[ip] = r
-                self.host_port_map[ip] = self.num_agg + h
+                self.host_port_map[ip] = uplinks_count + h
 
         # Node inet ngoài DCN cắm vào Core Switch (c1 DPID 33, Port 1)
         self.host_switch_map[self.inet_ip] = 33
@@ -363,6 +400,18 @@ class ComprehensiveManagementPlane:
             return f"h{r}_{h}"
         return ip
 
+    def get_cluster_by_rack(self, rack_num):
+        """Xác định Cụm của một rack Access Switch (dựa trên cấu hình topology_config.json)."""
+        if not self.is_clustered:
+            return "default"
+        for cl_key in ["cluster_1", "cluster_2"]:
+            cl_info = self.clusters_cfg.get(cl_key, {})
+            racks = cl_info.get("racks", [])
+            access_names = cl_info.get("access_switches", [])
+            if rack_num in racks or f"a{rack_num}" in access_names:
+                return cl_key
+        return "cluster_1" if rack_num <= 4 else "cluster_2"
+
     def get_link_type_and_capacity(self, src_name, dst_name):
         """Xác định loại liên kết và dung lượng băng thông thiết kế (Capacity Mbps)."""
         s, d = str(src_name).lower(), str(dst_name).lower()
@@ -379,17 +428,18 @@ class ComprehensiveManagementPlane:
     def get_active_switches(self):
         """Lấy danh sách các Switch đang kết nối tới Ryu Controller."""
         try:
-            resp = requests.get(f"{self.rest_url}/stats/switches", timeout=0.8)
+            resp = self.session.get(f"{self.rest_url}/stats/switches", timeout=0.8)
             if resp.status_code == 200:
                 return resp.json()
         except Exception:
+            # Ryu Controller tạm thời chưa phản hồi hoặc bận
             pass
         return []
 
     def update_topology_graph(self):
         """Cập nhật đồ thị liên kết topo chi tiết cả out_port và in_port giữa các switch."""
         try:
-            resp = requests.get(f"{self.rest_url}/v1.0/topology/links", timeout=0.8)
+            resp = self.session.get(f"{self.rest_url}/v1.0/topology/links", timeout=0.8)
             if resp.status_code == 200:
                 self.topo_graph.clear()
                 for link in resp.json():
@@ -400,25 +450,63 @@ class ComprehensiveManagementPlane:
                     self.topo_graph.add_edge(src_dpid, dst_dpid, out_port=src_port, in_port=dst_port)
                     self.topo_graph.add_edge(dst_dpid, src_dpid, out_port=dst_port, in_port=src_port)
         except Exception:
+            # Topology links chưa thay đổi hoặc Ryu API tạm thời bận
             pass
 
     def get_group_desc(self, dpid):
+        if hasattr(self, '_cycle_group_desc') and dpid in self._cycle_group_desc:
+            return self._cycle_group_desc[dpid]
         try:
-            resp = requests.get(f"{self.rest_url}/stats/groupdesc/{dpid}", timeout=0.8)
+            resp = self.session.get(f"{self.rest_url}/stats/groupdesc/{dpid}", timeout=0.5)
             if resp.status_code == 200:
-                return resp.json().get(str(dpid), [])
+                data = resp.json().get(str(dpid), [])
+                if hasattr(self, '_cycle_group_desc'):
+                    self._cycle_group_desc[dpid] = data
+                return data
         except Exception:
+            # Không có group desc hoặc switch không hỗ trợ group
             pass
         return []
 
     def get_group_stats(self, dpid):
+        if hasattr(self, '_cycle_group_stats') and dpid in self._cycle_group_stats:
+            return self._cycle_group_stats[dpid]
         try:
-            resp = requests.get(f"{self.rest_url}/stats/group/{dpid}", timeout=0.8)
+            resp = self.session.get(f"{self.rest_url}/stats/group/{dpid}", timeout=0.5)
             if resp.status_code == 200:
-                return resp.json().get(str(dpid), [])
+                data = resp.json().get(str(dpid), [])
+                if hasattr(self, '_cycle_group_stats'):
+                    self._cycle_group_stats[dpid] = data
+                return data
         except Exception:
+            # Không có group stats hoặc nhóm chưa truyền traffic
             pass
         return []
+
+    def _fetch_single_switch_telemetry(self, dpid):
+        """
+        Truy vấn song song Port Stats và Flow Table của một Switch qua HTTP Keep-Alive Session.
+        Loại bỏ hoàn toàn OFPTableStatsRequest (tránh 254 tables làm nghẽn Eventlet của Ryu).
+        """
+        port_stats = []
+        flow_stats = []
+        try:
+            p_resp = self.session.get(f"{self.rest_url}/stats/port/{dpid}", timeout=0.8)
+            if p_resp.status_code == 200:
+                port_stats = p_resp.json().get(str(dpid), [])
+        except Exception:
+            # Bỏ qua khi switch tạm thời không phản hồi port stats
+            pass
+
+        try:
+            f_resp = self.session.get(f"{self.rest_url}/stats/flow/{dpid}", timeout=0.8)
+            if f_resp.status_code == 200:
+                flow_stats = f_resp.json().get(str(dpid), [])
+        except Exception:
+            # Bỏ qua khi switch tạm thời không phản hồi flow stats
+            pass
+
+        return dpid, port_stats, flow_stats
 
     def determine_active_out_port(self, dpid, group_id):
         """Giải mã cổng vật lý đang chuyển gói trong bảng nhóm ECMP."""
@@ -624,7 +712,20 @@ class ComprehensiveManagementPlane:
             tot_bytes = sbytes + dbytes
             tot_pkts = Spkts + Dpkts
             if tot_bytes == 0:
-                continue
+                # First-Packet Accounting: Luật 5-tuple Priority 150 chỉ xuất hiện trong OVS khi đã có
+                # ít nhất 1 gói tin thực tế kích hoạt Packet-In (ví dụ luồng UDP Memcached 1 gói).
+                if d_pt in (5201, 5202, 5203, 5204, 9999) or s_pt >= d_pt:
+                    src_ip, dst_ip = s_ip, d_ip
+                    src_port, dst_port = s_pt, d_pt
+                else:
+                    src_ip, dst_ip = d_ip, s_ip
+                    src_port, dst_port = d_pt, s_pt
+                sbytes = 64
+                dbytes = 0
+                Spkts = 1
+                Dpkts = 0
+                tot_bytes = 64
+                tot_pkts = 1
 
             # 1. Flow State Machine: Theo dõi vòng đời luồng và chống nhân bản luồng lặp
             tracker = self.flow_tracker.get(pair_id)
@@ -694,7 +795,7 @@ class ComprehensiveManagementPlane:
     # ==========================================================================
     # 2. GIÁM SÁT TÀI NGUYÊN THIẾT BỊ (SWITCH & HOST TELEMETRY)
     # ==========================================================================
-    def collect_device_telemetry(self, active_dpids, now_str, dt):
+    def collect_device_telemetry(self, active_dpids, now_str, dt, raw_port_stats_map=None, switch_flows_map=None):
         """
         Thu thập toàn diện tài nguyên Host Containers và Switch OVS:
         CPU %, RAM used (MB), RAM limit (MB), RAM %, Network Rx/Tx bytes, Network I/O (Mbps), Drop count.
@@ -738,7 +839,8 @@ class ComprehensiveManagementPlane:
                     "network_rx_mbps": rx_mbps,
                     "network_tx_mbps": tx_mbps,
                     "packet_drop_count": 0,
-                    "tcam_entries": "-"
+                    "tcam_entries": "-",
+                    "tcam_usage_pct": "-"
                 }
                 device_records.append(dev_rec)
 
@@ -751,6 +853,7 @@ class ComprehensiveManagementPlane:
                     "ram_limit_mb": round(mem_limit_mb, 2),
                     "ram_usage_pct": round(mem_pct, 2),
                     "tcam_entries": "-",
+                    "tcam_usage_pct": "-",
                     "total_tx_bytes": int(net_tx_bytes),
                     "total_rx_bytes": int(net_rx_bytes),
                     "tx_mbps": tx_mbps,
@@ -761,6 +864,7 @@ class ComprehensiveManagementPlane:
                 }
                 health_records.append(hlth_rec)
         except Exception:
+            # Bỏ qua khi collector thread chưa có dữ liệu ban đầu
             pass
 
         # 2. Thu thập Telemetry Switch OVS từ Ryu REST API theo Dynamic Resource Attribution Model
@@ -774,63 +878,65 @@ class ComprehensiveManagementPlane:
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 pass
 
-        # PHA 1: Thu thập số liệu mạng & bảng luồng của toàn bộ active switches
+        # PHA 1: Trích xuất số liệu mạng & bảng luồng từ dữ liệu thu thập song song
         sw_metrics = {}
         for dpid in active_dpids:
             sw_name = self.format_dpid_name(dpid)
-            tcam_count = 0
             tx_bytes, rx_bytes = 0, 0
             tx_pkts, rx_pkts = 0, 0
             tx_dropped, rx_dropped, errors = 0, 0, 0
             port_stats_by_dpid[dpid] = {}
 
-            # Đọc tổng số flow rules trên TOÀN BỘ các bảng (Table 0 + Table 1)
-            try:
-                t_resp = requests.get(f"{self.rest_url}/stats/table/{dpid}", timeout=0.8)
-                if t_resp.status_code == 200:
-                    tcam_count = sum(t.get("active_count", 0) for t in t_resp.json().get(str(dpid), []))
-            except Exception:
-                pass
+            # TCAM Active Rules: Lấy trực tiếp từ switch_flows_map (không gọi /stats/table/ 254 tables gây nghẽn)
+            if switch_flows_map and dpid in switch_flows_map:
+                tcam_count = len(switch_flows_map[dpid])
+            else:
+                tcam_count = 0
 
-            # Đọc port statistics
-            try:
-                p_resp = requests.get(f"{self.rest_url}/stats/port/{dpid}", timeout=0.8)
-                if p_resp.status_code == 200:
-                    for ps in p_resp.json().get(str(dpid), []):
-                        p_raw = ps.get("port_no")
-                        if str(p_raw).upper() == "LOCAL":
-                            continue
-                        try:
-                            port_no = int(p_raw)
-                            if port_no >= 0xFFFFFF00:
-                                continue
-                        except (ValueError, TypeError):
-                            continue
+            # Đọc port statistics đã nạp song song (hoặc fallback nếu gọi đơn lẻ)
+            p_list = raw_port_stats_map.get(dpid, []) if raw_port_stats_map is not None else []
+            if raw_port_stats_map is None:
+                try:
+                    p_resp = self.session.get(f"{self.rest_url}/stats/port/{dpid}", timeout=0.8)
+                    if p_resp.status_code == 200:
+                        p_list = p_resp.json().get(str(dpid), [])
+                except Exception:
+                    # Bỏ qua khi truy vấn port đơn lẻ gặp lỗi
+                    p_list = []
 
-                        p_tx_b = int(ps.get("tx_bytes", 0))
-                        p_rx_b = int(ps.get("rx_bytes", 0))
-                        p_tx_p = int(ps.get("tx_packets", 0))
-                        p_rx_p = int(ps.get("rx_packets", 0))
-                        p_tx_d = int(ps.get("tx_dropped", 0))
-                        p_rx_d = int(ps.get("rx_dropped", 0))
-                        p_err = int(ps.get("tx_errors", 0)) + int(ps.get("rx_errors", 0))
+            for ps in p_list:
+                p_raw = ps.get("port_no")
+                if str(p_raw).upper() == "LOCAL":
+                    continue
+                try:
+                    port_no = int(p_raw)
+                    if port_no >= 0xFFFFFF00:
+                        continue
+                except (ValueError, TypeError):
+                    continue
 
-                        tx_bytes += p_tx_b
-                        rx_bytes += p_rx_b
-                        tx_pkts += p_tx_p
-                        rx_pkts += p_rx_p
-                        tx_dropped += p_tx_d
-                        rx_dropped += p_rx_d
-                        errors += p_err
+                p_tx_b = int(ps.get("tx_bytes", 0))
+                p_rx_b = int(ps.get("rx_bytes", 0))
+                p_tx_p = int(ps.get("tx_packets", 0))
+                p_rx_p = int(ps.get("rx_packets", 0))
+                p_tx_d = int(ps.get("tx_dropped", 0))
+                p_rx_d = int(ps.get("rx_dropped", 0))
+                p_err = int(ps.get("tx_errors", 0)) + int(ps.get("rx_errors", 0))
 
-                        port_stats_by_dpid[dpid][port_no] = {
-                            "tx_bytes": p_tx_b, "rx_bytes": p_rx_b,
-                            "tx_packets": p_tx_p, "rx_packets": p_rx_p,
-                            "tx_dropped": p_tx_d, "rx_dropped": p_rx_d,
-                            "errors": p_err
-                        }
-            except Exception:
-                pass
+                tx_bytes += p_tx_b
+                rx_bytes += p_rx_b
+                tx_pkts += p_tx_p
+                rx_pkts += p_rx_p
+                tx_dropped += p_tx_d
+                rx_dropped += p_rx_d
+                errors += p_err
+
+                port_stats_by_dpid[dpid][port_no] = {
+                    "tx_bytes": p_tx_b, "rx_bytes": p_rx_b,
+                    "tx_packets": p_tx_p, "rx_packets": p_rx_p,
+                    "tx_dropped": p_tx_d, "rx_dropped": p_rx_d,
+                    "errors": p_err
+                }
 
             # Tính delta throughput & delta packets cho switch
             prev_sw_port = self.last_port_stats.get((dpid, "TOTAL"), (time.time() - dt, tx_bytes, rx_bytes, tx_pkts, rx_pkts, tx_dropped, errors))
@@ -927,10 +1033,12 @@ class ComprehensiveManagementPlane:
 
             per_switch_cpu = round(ovs_cpu * w_cpu_map.get(dpid, 1.0 / num_switches), 2)
             per_switch_ram = round(ovs_ram_mb * w_ram_map.get(dpid, 1.0 / num_switches), 2)
+            per_switch_tcam_pct = round((tcam_count / max(getattr(self, "tcam_capacity_rules", 1000), 1)) * 100.0, 2)
 
             existing_dev = [r for r in device_records if r["node_name"] == sw_name]
             if existing_dev:
                 existing_dev[0]["tcam_entries"] = tcam_count
+                existing_dev[0]["tcam_usage_pct"] = per_switch_tcam_pct
                 existing_dev[0]["packet_drop_count"] = tx_dropped + rx_dropped
                 existing_dev[0]["cpu_percent"] = per_switch_cpu
                 existing_dev[0]["memory_usage_mb"] = per_switch_ram
@@ -949,12 +1057,14 @@ class ComprehensiveManagementPlane:
                     "network_rx_mbps": sw_rx_mbps,
                     "network_tx_mbps": sw_tx_mbps,
                     "packet_drop_count": tx_dropped + rx_dropped,
-                    "tcam_entries": tcam_count
+                    "tcam_entries": tcam_count,
+                    "tcam_usage_pct": per_switch_tcam_pct
                 })
 
             existing_hlth = [r for r in health_records if r["node_name"] == sw_name]
             if existing_hlth:
                 existing_hlth[0]["tcam_entries"] = tcam_count
+                existing_hlth[0]["tcam_usage_pct"] = per_switch_tcam_pct
                 existing_hlth[0]["cpu_usage_pct"] = per_switch_cpu
                 existing_hlth[0]["ram_used_mb"] = per_switch_ram
                 existing_hlth[0]["ram_usage_pct"] = round((per_switch_ram / 1024.0) * 100.0, 2)
@@ -968,6 +1078,7 @@ class ComprehensiveManagementPlane:
                     "ram_limit_mb": 1024.0,
                     "ram_usage_pct": round((per_switch_ram / 1024.0) * 100.0, 2),
                     "tcam_entries": tcam_count,
+                    "tcam_usage_pct": per_switch_tcam_pct,
                     "total_tx_bytes": tx_bytes,
                     "total_rx_bytes": rx_bytes,
                     "tx_mbps": sw_tx_mbps,
@@ -1113,21 +1224,29 @@ class ComprehensiveManagementPlane:
             # Lần vết toàn bộ lộ trình cụ thể Hop-by-Hop
             hop_count, path_str = self.trace_full_path(src_ip, dst_ip, switch_flows_map)
 
-            # Xác định phân vùng phụ tải Locality
+            # Xác định phân vùng phụ tải Locality (Tự thích ứng theo cấu hình Cụm)
             src_name = self.ip_to_host_name(src_ip)
             dst_name = self.ip_to_host_name(dst_ip)
             if src_ip == self.inet_ip or dst_ip == self.inet_ip:
                 locality = "Extra-DC"
             elif self.host_switch_map.get(src_ip) == self.host_switch_map.get(dst_ip):
                 locality = "Intra-Rack"
+            elif self.is_clustered:
+                src_rack = self.host_switch_map.get(src_ip, 0)
+                dst_rack = self.host_switch_map.get(dst_ip, 0)
+                if self.get_cluster_by_rack(src_rack) == self.get_cluster_by_rack(dst_rack):
+                    locality = "Intra-Cluster"
+                else:
+                    locality = "Intra-DC"
             else:
                 locality = "Extra-Rack"
 
-            # Gán nhãn Ground Truth (1: Elephant, 0: Mice)
-            is_elephant = 1 if (
-                Sload > ELEPHANT_BYTE_RATE_THRESHOLD or
-                sbytes > ELEPHANT_TOTAL_BYTES_THRESHOLD
-            ) else 0
+            # Gán nhãn Ground Truth chuẩn Presto / SIGCOMM 2015 (1: Elephant, 0: Mice, -1: Unlabeled khi threshold là null)
+            if self.s_threshold_bytes is None or self.s_threshold_bytes <= 0:
+                is_elephant = -1  # Unlabeled (Chưa gán nhãn, bảo toàn tính khách quan)
+            else:
+                # Sử dụng DUY NHẤT 1 ngưỡng toàn mạng: S_threshold_bytes từ traffic_config.json (64 KB)
+                is_elephant = 1 if sbytes >= self.s_threshold_bytes else 0
 
             flow_records.append({
                 "timestamp": now_str,
@@ -1167,15 +1286,20 @@ class ComprehensiveManagementPlane:
         Throughput, Bisection Bandwidth, Packet Loss Rate %, Jain's Fairness Index, Mice FCT.
         """
         active_flows_count = len(flow_records)
-        active_elephant = sum(1 for f in flow_records if f["label"] == 1)
-        active_mice = active_flows_count - active_elephant
+        if self.s_threshold_bytes is None or self.s_threshold_bytes <= 0:
+            active_elephant = 0
+            active_mice = 0
+            mice_durs = [f["dur"] for f in flow_records]
+        else:
+            active_elephant = sum(1 for f in flow_records if f["label"] == 1)
+            active_mice = sum(1 for f in flow_records if f["label"] == 0)
+            mice_durs = [f["dur"] for f in flow_records if f["label"] == 0]
 
         # 1. Tổng thông lượng mạng (Mbps): Tổng thông lượng chuyển giao tại các chặng biên xuống host
         host_links = [l for l in link_records if l["link_type"] in ["Access-Host", "Core-Inet"]]
-        if host_links:
-            total_throughput = round(sum(l["tx_rate_mbps"] for l in host_links), 2)
-        else:
-            total_throughput = round(sum(f["Sload"] * 8.0 / 1e6 for f in flow_records), 2)
+        link_throughput = round(sum(l["tx_rate_mbps"] for l in host_links), 2) if host_links else 0.0
+        flow_throughput = round(sum(f["Sload"] * 8.0 / 1e6 for f in flow_records), 2) if flow_records else 0.0
+        total_throughput = link_throughput if link_throughput > 0.0 else flow_throughput
 
         # 2. Mức độ chiếm dụng đường cắt ngang (Core-Agg bisection links)
         core_agg_links = [l for l in link_records if l["link_type"] == "Core-Agg"]
@@ -1210,14 +1334,13 @@ class ComprehensiveManagementPlane:
 
         # 5. Số chặng trung bình & Thời gian hoàn thành luồng chuột (Mice FCT indicator)
         avg_hop = round(float(np.mean([f["hop_count"] for f in flow_records])), 2) if flow_records else 0.0
-        mice_durs = [f["dur"] for f in flow_records if f["label"] == 0]
         avg_mice_dur = round(float(np.mean(mice_durs)), 4) if mice_durs else 0.0
 
         kpi_rec = {
             "timestamp": now_str,
             "active_flows_count": active_flows_count,
-            "active_elephant_flows": active_elephant,
-            "active_mice_flows": active_mice,
+            "active_elephant_flows": active_elephant if (self.s_threshold_bytes and self.s_threshold_bytes > 0) else "N/A",
+            "active_mice_flows": active_mice if (self.s_threshold_bytes and self.s_threshold_bytes > 0) else "N/A",
             "total_network_throughput_mbps": total_throughput,
             "bisection_utilization_pct": bisection_util,
             "overall_packet_loss_rate_pct": loss_rate_pct,
@@ -1241,7 +1364,12 @@ class ComprehensiveManagementPlane:
         jains = kpi_record.get("jains_fairness_index", 1.0) if kpi_record else 1.0
         drops = kpi_record.get("total_network_drops", 0) if kpi_record else 0
 
-        print(f"[{time_str}] [Telemetry Poller] Flows: {n_flows:3d} (Voi: {n_eleph:2d}, Chuột: {n_mice:2d}) | Throughput: {thru:6.2f} Mbps | Core-Agg: {core_util:5.1f}% (Jain's: {jains:.3f}) | Nodes: {n_nodes:2d} | Drops: {drops}")
+        if self.s_threshold_bytes is None or self.s_threshold_bytes <= 0:
+            type_str = "Unlabeled"
+        else:
+            type_str = f"Voi: {n_eleph:2d}, Chuột: {n_mice:2d}"
+
+        print(f"[{time_str}] [Telemetry Poller] Flows: {n_flows:3d} ({type_str}) | Throughput: {thru:6.2f} Mbps | Core-Agg: {core_util:5.1f}% (Jain's: {jains:.3f}) | Nodes: {n_nodes:2d} | Drops: {drops}")
 
     # ==========================================================================
     # 6. VÒNG LẶP CHÍNH THU THẬP VÀ GHI DỮ LIỆU ĐỒNG THỜI
@@ -1252,46 +1380,52 @@ class ComprehensiveManagementPlane:
         self.last_time = cur_time
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        active_dpids = self.get_active_switches()
+        # Reset bộ nhớ đệm Group Table cho chu kỳ mới (chống bão HTTP khi dò vết luồng)
+        self._cycle_group_desc = {}
+        self._cycle_group_stats = {}
 
-        # 1. Thu thập Telemetry Thiết bị (Host Containers & Switches)
-        device_records, health_records, port_stats_by_dpid = self.collect_device_telemetry(active_dpids, now_str, dt)
+        active_dpids = self.get_active_switches()
+        if not active_dpids:
+            return
+
+        # 1. Thu thập song song Port Stats và Flow Stats của toàn bộ active switches (Zero-Stall, Multi-threaded)
+        raw_port_stats_map = {}
+        switch_flows_map = {}
+        max_workers = min(len(active_dpids), 16)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            results = executor.map(self._fetch_single_switch_telemetry, active_dpids)
+            for dpid, p_stats, f_stats in results:
+                raw_port_stats_map[dpid] = p_stats
+                switch_flows_map[dpid] = f_stats
+
+        # 2. Thu thập Telemetry Thiết bị (Host Containers & Switches)
+        device_records, health_records, port_stats_by_dpid = self.collect_device_telemetry(
+            active_dpids, now_str, dt, raw_port_stats_map=raw_port_stats_map, switch_flows_map=switch_flows_map
+        )
         if device_records:
             pd.DataFrame(device_records).to_csv(self.device_csv, mode="a", header=False, index=False)
         if health_records:
             pd.DataFrame(health_records).to_csv(self.health_csv, mode="a", header=False, index=False)
 
-        if not active_dpids:
-            return
-
-        # 2. Cập nhật đồ thị liên kết topo
+        # 3. Cập nhật đồ thị liên kết topo
         self.update_topology_graph()
 
-        # 3. Thu thập Telemetry Liên kết (Throughput, Utilization %, Drops)
+        # 4. Thu thập Telemetry Liên kết (Throughput, Utilization %, Drops)
         link_records = self.collect_link_telemetry(active_dpids, port_stats_by_dpid, now_str, dt)
         if link_records:
             pd.DataFrame(link_records).to_csv(self.link_csv, mode="a", header=False, index=False)
 
-        # 4. Đọc Flow Table của tất cả các Switch & Ghép cặp Bi-flow
-        switch_flows_map = {}
-        for dpid in active_dpids:
-            try:
-                resp = requests.get(f"{self.rest_url}/stats/flow/{dpid}", timeout=0.8)
-                if resp.status_code == 200:
-                    switch_flows_map[dpid] = resp.json().get(str(dpid), [])
-            except Exception:
-                switch_flows_map[dpid] = []
-
+        # 5. Ghép cặp Bi-flow & Lần vết đường đi Hop-by-Hop (10 Features cho AI Classifier)
         flow_records = self.collect_flow_dataset(active_dpids, switch_flows_map, now_str)
         if flow_records:
             pd.DataFrame(flow_records).to_csv(self.flow_csv, mode="a", header=False, index=False)
 
-        # 5. Tính toán và lưu trữ các chỉ số KPI Đánh giá Toàn mạng (Evaluation Benchmarks)
+        # 6. Tính toán và lưu trữ các chỉ số KPI Đánh giá Toàn mạng (Evaluation Benchmarks)
         kpi_record = self.compute_and_save_kpis(flow_records, link_records, health_records, now_str)
         if kpi_record:
             pd.DataFrame([kpi_record]).to_csv(self.kpi_csv, mode="a", header=False, index=False)
 
-        # 6. In Dashboard trạng thái thời gian thực ra màn hình
+        # 7. In Dashboard trạng thái thời gian thực ra màn hình
         self._print_dashboard(now_str, flow_records, device_records, link_records, kpi_record)
 
 
@@ -1311,9 +1445,14 @@ def main():
 
     try:
         while True:
+            cycle_start = time.time()
             collector.collect_and_save_all()
-            time.sleep(POLL_INTERVAL_SEC)
+            elapsed = time.time() - cycle_start
+            sleep_time = max(0.05, POLL_INTERVAL_SEC - elapsed)
+            time.sleep(sleep_time)
     except KeyboardInterrupt:
+        if hasattr(collector, 'session'):
+            collector.session.close()
         if collector.ebpf_manager:
             collector.ebpf_manager.cleanup()
         if hasattr(collector, 'docker_collector'):

@@ -10,10 +10,13 @@ import os
 import sys
 import pymupdf
 
-PDF_PATH = os.path.join("Documents", "Inside the Social Network’s (Datacenter) Network.pdf")
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "..", ".."))
+
+PDF_PATH = os.path.join(PROJECT_ROOT, "Documents", "Inside the Social Network’s (Datacenter) Network.pdf")
 OUTPUT_DIRS = [
-    os.path.join("Documents", "extracted_figures"),
-    os.path.join("controller", "extracted_figures")
+    os.path.join(PROJECT_ROOT, "Documents", "extracted_figures"),
+    os.path.join(SCRIPT_DIR, "extracted_figures")
 ]
 
 # Danh sách cấu hình trích xuất (Page 1-indexed, Tên file, BBox toạ độ: x0, y0, x1, y1)

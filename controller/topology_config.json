@@ -19,6 +19,8 @@
   "switches": {
     "switch_type": "docker_ovs",
     "dimage": "dcn-ovs:latest",
+    "tcam_capacity_rules": 1000,
+    "tcam_note": "Dung lượng bảng luật TCAM phần cứng giả lập trên mỗi Switch (1,000 Flow Entries theo chuẩn Broadcom Trident II / OpenFlow 1.3).",
     "core": {
       "count": 2,
       "prefix": "c",
@@ -65,21 +67,43 @@
       }
     }
   },
+  "clusters": {
+    "enabled": true,
+    "cluster_1": {
+      "name": "Frontend_Web_Cluster",
+      "aggregation_switches": ["ag1", "ag2"],
+      "access_switches": ["a1", "a2", "a3", "a4"],
+      "racks": [1, 2, 3, 4]
+    },
+    "cluster_2": {
+      "name": "Backend_Cache_DB_Cluster",
+      "aggregation_switches": ["ag3", "ag4"],
+      "access_switches": ["a5", "a6", "a7", "a8"],
+      "racks": [5, 6, 7, 8]
+    }
+  },
   "links": {
     "bandwidth_mbps": {
-      "core_inet": 100,
-      "core_agg": 100,
-      "agg_access": 50,
-      "access_host": 20.0
+      "core_inet": 200.0,
+      "core_agg": 200.0,
+      "agg_access": 100.0,
+      "access_host": 100.0
     },
     "delay": "1ms",
     "jitter": "0.1ms",
     "loss_percent": 0.0,
     "max_queue_size_packets": 1000
   },
+  "ecn": {
+    "enabled": "ref:traffic_config.json#/ecn_settings/enabled",
+    "marking_threshold_k_bytes": "ref:traffic_config.json#/ecn_settings/marking_threshold_k_bytes",
+    "limit_bytes": "ref:traffic_config.json#/ecn_settings/limit_bytes",
+    "note": "Các thông số ECN được tham chiếu và quản trị tập trung từ traffic_config.json."
+  },
   "hosts": {
     "dimage": "dcn-host:latest",
     "hosts_per_rack": 4,
+    "total_hosts": 32,
     "naming_pattern": "h{rack}_{host}",
     "ip_prefix": "10.0.0.",
     "subnet_mask": "/24",

@@ -19,6 +19,7 @@ import sys
 import signal
 import os
 import argparse
+from concurrent.futures import ThreadPoolExecutor, wait as wait_futures
 
 # Đảm bảo UTF-8
 if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
@@ -67,12 +68,18 @@ def discover_docker_hosts():
     for c_name in docker_ps:
         if c_name.startswith("mn."):
             short_name = c_name.replace("mn.", "")
+            # Lọc bỏ triệt để switch containers (a1..a8, ag1..ag4, c1..c2)
+            if not (re.match(r"^h\d+_\d+$", short_name) or short_name == "inet"):
+                continue
+
             try:
                 ip_out = subprocess.check_output(
                     f"docker exec {c_name} ip -4 -o addr show",
-                    shell=True
+                    shell=True,
+                    stderr=subprocess.DEVNULL
                 ).decode()
-                match = re.search(r"inet\s+(10\.\d+\.\d+\.\d+)/\d+", ip_out)
+                # Chỉ lấy IP dải host DCN 10.0.0.x (loại trừ 10.255.0.x của proxy-int)
+                match = re.search(r"inet\s+(10\.0\.0\.\d+)/\d+", ip_out)
                 if match:
                     ip_addr = match.group(1)
                     discovered_hosts[short_name] = {
@@ -111,24 +118,24 @@ ENGINE_PATH = os.path.join(os.path.dirname(__file__), "dcn_flow_engine.py")
 
 def start_flow_servers(host_dict, iperf_ports):
     """
-    Khởi động DCN Flow Engine Server đa luồng và iperf3 fallback trên toàn bộ các container:
-    1. Dọn dẹp sạch tiến trình cũ trên toàn bộ host đồng thời.
+    Khởi động DCN Flow Engine Server đa luồng trên toàn bộ các container:
+    1. Dọn dẹp sạch tiến trình cũ (cả dcn_flow_engine.py và iperf3) trên toàn bộ host đồng thời.
     2. Sao chép dcn_flow_engine.py vào /tmp/ của từng container.
-    3. Bật daemon Flow Server siêu nhẹ (hỗ trợ hàng nghìn kết nối đồng thời, không nghẽn).
+    3. Bật độc quyền daemon Flow Server siêu nhẹ (tránh xung đột cướp cổng TCP/UDP với iperf3 -s).
     """
     ports_str = ",".join(map(str, iperf_ports))
     print(f"[*] Phổ biến DCN Flow Engine và khởi động server đa cổng [{ports_str}] trên {len(host_dict)} containers...")
     procs = []
     for h_name, h_info in host_dict.items():
         c_name = h_info['container_name']
-        # Dọn dẹp sạch tiến trình cũ
-        cmd_clean = f"docker exec {c_name} pkill -f dcn_flow_engine.py 2>/dev/null; docker exec {c_name} killall -9 iperf3 2>/dev/null"
+        # Dọn dẹp sạch tiến trình cũ (đặc biệt diệt iperf3 -s để không chiếm cổng của dcn_flow_engine)
+        cmd_clean = f"docker exec {c_name} killall -9 iperf3 2>/dev/null; docker exec {c_name} pkill -f dcn_flow_engine.py 2>/dev/null"
         procs.append(subprocess.Popen(cmd_clean, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
-        
+
         # Sao chép dcn_flow_engine.py vào container nếu có
         if os.path.exists(ENGINE_PATH):
             subprocess.run(f"docker cp \"{ENGINE_PATH}\" {c_name}:/tmp/dcn_flow_engine.py", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            
+
     for p in procs:
         try:
             p.wait(timeout=2)
@@ -137,11 +144,8 @@ def start_flow_servers(host_dict, iperf_ports):
 
     for h_name, h_info in host_dict.items():
         c_name = h_info["container_name"]
-        # Khởi chạy Flow Server chính
+        # Khởi chạy độc quyền Flow Server chính (TCP + UDP) trên các cổng 5201-5204
         exec_in_container(c_name, f"python3 /tmp/dcn_flow_engine.py --server -p {ports_str}", is_background=True)
-        # Khởi chạy iperf3 dự phòng
-        for p in iperf_ports:
-            exec_in_container(c_name, f"iperf3 -s -p {p} -B {h_info['ip']} -D", is_background=True)
 
     time.sleep(1.5)
     print(f"[+] Toàn bộ Flow Servers ({len(host_dict)} hosts x {len(iperf_ports)} ports) đã sẵn sàng.")
@@ -233,22 +237,39 @@ def main():
         mode_desc = f"Giới hạn số luồng: {args.flows:,} luồng (hoặc bấm Ctrl + C để dừng sớm)"
 
     print("\n" + "=" * 80)
-    print("[*] BẮT ĐẦU SINH TẢI DATACENTER THỐNG NHẤT (UNIFIED DCN WORKLOAD - v3)")
+    print("[*] BẮT ĐẦU SINH TẢI DATACENTER THỐNG NHẤT (UNIFIED DCN WORKLOAD - v4)")
     print(f"    - Băng thông cấu hình : {sampler.c_host} Mbps (Hệ số scale alpha = {sampler.alpha:.5f})")
     print(f"    - Giãn nhịp phát      : {sampler.d_arrival:.1f}x (Bảo toàn độ tải CPU máy chủ ảo)")
-    print(f"    - Phân bổ 3 vùng      : Intra={sampler.r_intra*100:.1f}%, Extra={sampler.r_extra*100:.1f}%, Internet={sampler.r_dc*100:.1f}%")
-    print(f"    - Cổng iperf3 đa kênh : {sampler.iperf_ports} (Chống nghẽn server busy)")
-    print(f"    - Công cụ phát        : Đồng nhất iperf3 -n {{S_scaled}} cho mọi luồng")
+    # Tính toán động min_burst và max_burst dựa trên tổng số host nội bộ thực tế
+    num_internal = len(internal_hosts)
+    min_burst = max(1, int(round(num_internal * sampler.min_burst_ratio)))
+    max_burst = max(min_burst, int(round(num_internal * sampler.max_burst_ratio)))
+    # Hệ số đệm an toàn 2x (Headroom Factor) hấp thụ hoàn toàn các luồng voi gối đầu giữa các đợt phát
+    worker_count = max(sampler.max_workers, num_internal) * 2
+
+    if sampler.is_clustered:
+        print(f"    - Phân bổ 4 cấp Cụm   : Intra-Rack={sampler.r_intra_rack*100:.1f}%, Intra-Cluster={sampler.r_intra_cluster*100:.1f}%, Intra-DC={sampler.r_intra_dc*100:.1f}%, Internet={sampler.r_extra_dc*100:.1f}%")
+    else:
+        print(f"    - Phân bổ 3 vùng phẳng: Intra={sampler.r_intra_rack*100:.1f}%, Extra={sampler.r_extra_rack*100:.1f}%, Internet={sampler.r_extra_dc*100:.1f}%")
+    print(f"    - Bơm tải đa luồng   : ThreadPoolExecutor (max_workers={worker_count} [Hệ số gối đầu 2x cho {num_internal} hosts])")
+    print(f"    - Bùng nổ Incast/Coflow: {min_burst} - {max_burst} hosts/đợt ({sampler.min_burst_ratio*100:.1f}% - {sampler.max_burst_ratio*100:.1f}% tổng số {num_internal} hosts)")
+    print(f"    - Giao thức phân vùng : {sampler.udp_ratio*100:.1f}% UDP Cache (Memcached), {(1.0-sampler.udp_ratio)*100:.1f}% TCP")
+    print(f"    - Cổng đa kênh        : {sampler.iperf_ports} (Chống nghẽn server busy)")
     print(f"    - Chế độ hoạt động    : {mode_desc}")
     print("=" * 80 + "\n")
 
     start_time = time.time()
     flow_count = 0
-    zone_stats = {"INTRA_RACK": 0, "EXTRA_RACK": 0, "EXTRA_DC": 0}
+    burst_count = 0
+    zone_stats = {}
+    executor = ThreadPoolExecutor(max_workers=worker_count)
+
+    def send_single_flow(src_cname, src_ip, dst_ip, port, s_bytes, protocol):
+        flow_cmd = f"python3 /tmp/dcn_flow_engine.py --client -d {dst_ip} -p {port} -b {s_bytes} -B {src_ip} --proto {protocol}"
+        exec_in_container(src_cname, flow_cmd, is_background=False, wait_timeout=20)
 
     try:
         while RUNNING:
-            # Kiểm tra điều kiện dừng tự động nếu có cấu hình tham số CLI
             if args.duration and (time.time() - start_time) >= args.duration:
                 print(f"\n[*] Đã đạt giới hạn thời gian chạy ({args.duration}s). Tự động dừng sinh tải.")
                 break
@@ -256,50 +277,80 @@ def main():
                 print(f"\n[*] Đã phát đủ {args.flows:,} luồng. Tự động dừng sinh tải.")
                 break
 
-            # 1. Chọn host nguồn ngẫu nhiên từ các host nội bộ
-            src_name = random.choice(internal_hosts)
-            src_info = hosts[src_name]
+            # 1. Tính toán ngẫu nhiên kích thước đợt bùng nổ (Incast burst size)
+            burst_size = random.randint(min_burst, max_burst)
+            if args.flows and (flow_count + burst_size) > args.flows:
+                burst_size = max(1, args.flows - flow_count)
 
-            # 2. Lấy mẫu đích theo 3 vùng Locality
-            dst_name, zone = sampler.sample_destination(src_name, hosts)
-            dst_info = hosts[dst_name]
-            zone_stats[zone] = zone_stats.get(zone, 0) + 1
+            # 2. Chọn ngẫu nhiên burst_size host nguồn phân biệt trong internal_hosts
+            sampled_srcs = random.sample(internal_hosts, burst_size)
 
-            # 3. Lấy mẫu kích thước luồng (Bytes) từ ECDF Facebook
-            s_raw, s_scaled = sampler.sample_flow_size()
-
-            # 4. Lấy mẫu khoảng thời gian chờ (Giây) từ ECDF Inter-Arrival
+            # 3. Lấy mẫu khoảng thời gian chờ (Giây) từ ECDF Inter-Arrival cho cả đợt
             dt_raw, dt_scaled = sampler.sample_inter_arrival()
-
-            # 5. Chọn cổng iperf3 ngẫu nhiên trong danh sách đa cổng
-            port = random.choice(sampler.iperf_ports)
-
-            flow_count += 1
+            burst_count += 1
             elapsed_min = (time.time() - start_time) / 60
 
-            # Hiển thị thông tin luồng định kỳ hoặc khi có luồng lớn
-            if flow_count % 10 == 0 or s_scaled >= 50000:
-                print(f"[{time.strftime('%H:%M:%S')}] [#{flow_count:,} | {elapsed_min:.1f}m] [{zone:<10}] {src_name} ({src_info['ip']}) -> {dst_name} ({dst_info['ip']}) | Port: {port} | Size: {s_scaled:,.0f} B (raw: {s_raw:,.0f} B) | Sleep: {dt_scaled*1000:.1f}ms")
+            # 4. Phát đồng loạt toàn bộ luồng trong đợt qua ThreadPoolExecutor (Có đồng bộ Backpressure)
+            burst_details = []
+            burst_futures = []
+            for src_name in sampled_srcs:
+                src_info = hosts[src_name]
 
-            # 6. Phát luồng TCP đồng nhất bằng Precise DCN Flow Engine (kết nối đơn, chuẩn từng byte)
-            flow_cmd = f"python3 /tmp/dcn_flow_engine.py --client -d {dst_info['ip']} -p {port} -b {s_scaled} -B {src_info['ip']}"
-            exec_in_container(src_info["container_name"], flow_cmd, is_background=True)
+                # Lấy mẫu đích theo phân phối Locality (tự thích ứng 4 cấp hoặc 3 cấp)
+                dst_name, zone = sampler.sample_destination(src_name, hosts)
+                dst_info = hosts[dst_name]
+                zone_stats[zone] = zone_stats.get(zone, 0) + 1
 
-            # 7. Nghỉ đúng khoảng thời gian giãn nhịp ECDF
-            time.sleep(dt_scaled)
+                # Lấy mẫu kích thước luồng (Bytes) từ ECDF Facebook
+                s_raw, s_scaled = sampler.sample_flow_size()
+
+                # Lấy mẫu giao thức (UDP cho Cache 18.4%, TCP cho các luồng còn lại)
+                proto = sampler.sample_protocol()
+
+                # Chọn cổng ngẫu nhiên trong danh sách đa cổng
+                port = random.choice(sampler.iperf_ports)
+
+                flow_count += 1
+                fut = executor.submit(send_single_flow, src_info["container_name"], src_info["ip"], dst_info["ip"], port, s_scaled, proto)
+                burst_futures.append(fut)
+                burst_details.append((src_name, dst_name, proto, s_scaled, zone))
+
+            # Chờ đợt bùng nổ hoàn tất (hoặc tối đa 5s) để chống nghẽn hàng đợi dockerd
+            if burst_futures:
+                wait_futures(burst_futures, timeout=5.0)
+
+            # Giãn nhịp giữa các đợt theo kích thước burst_size để bảo toàn tốc độ đến trung bình ECDF
+            burst_sleep = max(dt_scaled * burst_size, 0.5)
+
+            # Hiển thị thông tin đợt bùng nổ định kỳ hoặc khi có luồng voi lớn (Chuẩn SSoT S_threshold_bytes)
+            eleph_thresh = sampler.s_threshold if (sampler.s_threshold and sampler.s_threshold > 0) else 65536
+            has_elephant = any(s >= eleph_thresh for _, _, _, s, _ in burst_details)
+            if burst_count % 5 == 0 or has_elephant or burst_size == max_burst:
+                eleph_str = " [CÓ LUỒNG VOI]" if has_elephant else ""
+                print(f"[{time.strftime('%H:%M:%S')}] [Burst #{burst_count:,} | {elapsed_min:.1f}m] Bắn đồng thời {burst_size}/{num_internal} hosts ({burst_size/num_internal*100:.1f}%) | Tổng: {flow_count:,} luồng | Sleep: {burst_sleep*1000:.0f}ms{eleph_str}")
+
+            # 5. Nghỉ đúng khoảng thời gian giãn nhịp ECDF của cả đợt
+            time.sleep(burst_sleep)
 
     except KeyboardInterrupt:
         print("\n[!] Đã nhận tín hiệu ngắt chủ động từ người dùng (Ctrl + C). Đang tiến hành dừng...")
     except Exception as e:
         print(f"\n[!] Lỗi phát sinh trong quá trình sinh tải: {e}")
     finally:
+        try:
+            executor.shutdown(wait=False)
+        except Exception:
+            pass
         total_time_sec = time.time() - start_time
         print("\n" + "=" * 80)
         print("[*] TỔNG KẾT TIẾN TRÌNH SINH TẢI:")
         print(f"    - Thời gian chạy thực tế : {total_time_sec / 60:.2f} phút ({total_time_sec:.1f} giây)")
+        print(f"    - Tổng số đợt bùng nổ    : {burst_count:,} đợt")
         print(f"    - Tổng số luồng đã phát  : {flow_count:,} luồng")
         if flow_count > 0:
-            print(f"    - Tỷ lệ 3 vùng phân bổ   : Intra={zone_stats['INTRA_RACK']/flow_count*100:.1f}%, Extra={zone_stats['EXTRA_RACK']/flow_count*100:.1f}%, Internet={zone_stats['EXTRA_DC']/flow_count*100:.1f}%")
+            print("    - Tỷ lệ các vùng phân bổ :")
+            for z, cnt in sorted(zone_stats.items()):
+                print(f"      + {z:<14}: {cnt:,} luồng ({cnt/flow_count*100:.1f}%)")
         print("=" * 80)
         cleanup_traffic_processes(hosts)
 

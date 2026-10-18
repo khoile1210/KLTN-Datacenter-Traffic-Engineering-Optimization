@@ -31,9 +31,13 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-RAW_BASE = os.path.join("controller", "raw_digitized")
-PROFILES_DIR = os.path.join("controller", "cdf_profiles")
-RESULTS_DIR = os.path.join("results", "digitization_verification")
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+RAW_BASE = os.path.join(SCRIPT_DIR, "raw_digitized")
+if not os.path.exists(RAW_BASE):
+    RAW_BASE = os.path.join("controller", "supply", "raw_digitized")
+
+PROFILES_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "cdf_profiles"))
+RESULTS_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "..", "results", "digitization_verification"))
 
 os.makedirs(PROFILES_DIR, exist_ok=True)
 os.makedirs(RESULTS_DIR, exist_ok=True)

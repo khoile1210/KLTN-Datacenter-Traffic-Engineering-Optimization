@@ -32,11 +32,12 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-OUTPUT_BASE = os.path.join("controller", "raw_digitized")
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+OUTPUT_BASE = os.path.join(SCRIPT_DIR, "raw_digitized")
 FLOW_SIZE_DIR = os.path.join(OUTPUT_BASE, "flow_size")
 INTER_ARR_DIR = os.path.join(OUTPUT_BASE, "inter_arrival")
 FLOW_DUR_DIR = os.path.join(OUTPUT_BASE, "flow_duration")
-OVERLAY_DIR = os.path.join("results", "digitization_verification")
+OVERLAY_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "..", "results", "digitization_verification"))
 
 for d in [FLOW_SIZE_DIR, INTER_ARR_DIR, FLOW_DUR_DIR, OVERLAY_DIR]:
     os.makedirs(d, exist_ok=True)

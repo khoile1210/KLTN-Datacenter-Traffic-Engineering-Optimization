@@ -12,6 +12,7 @@ Mô tả   : Sinh toàn bộ hệ thống biểu đồ trực quan hóa dữ li�
 
 import os
 import sys
+import json
 from datetime import datetime
 import numpy as np
 import pandas as pd
@@ -56,7 +57,19 @@ def plot_traffic_flows():
     sort_sbytes = np.sort(sbytes)
     ecdf_sbytes = np.arange(1, len(sort_sbytes) + 1) / len(sort_sbytes)
     ax1.plot(sort_sbytes, ecdf_sbytes, color="#1f77b4", linewidth=2.2, label=f"Tất cả luồng (N={len(sort_sbytes):,})")
-    ax1.axvline(x=64*1024, color="#d62728", linestyle="--", linewidth=1.8, label="Ngưỡng Elephant (64 KB)")
+    
+    # Kiểm tra cấu hình ngưỡng: Chỉ vẽ đường dóng khi người dùng đã chủ động chốt ngưỡng cụ thể
+    cfg_path = os.path.join(os.path.dirname(__file__), "traffic_config.json")
+    s_th = None
+    if os.path.exists(cfg_path):
+        try:
+            with open(cfg_path, "r", encoding="utf-8") as cf:
+                s_th = json.load(cf).get("flow_threshold", {}).get("S_threshold_bytes")
+        except Exception:
+            pass
+    if s_th and s_th > 0:
+        ax1.axvline(x=s_th, color="#d62728", linestyle="--", linewidth=1.8, label=f"Ngưỡng Elephant ({s_th/1024:.1f} KB)")
+        
     ax1.set_xscale("log")
     ax1.set_title("Hàm phân phối tích lũy (ECDF) Kích thước luồng", fontsize=11, fontweight="bold")
     ax1.set_xlabel("Flow Size - sbytes (Bytes) [Thang Log]", fontsize=10)
@@ -73,33 +86,34 @@ def plot_traffic_flows():
     ax2.set_ylabel("Số lượng luồng", fontsize=10)
     ax2.grid(True, ls=":", alpha=0.6)
     
-    # 3. Locality Breakdown
+    # 3. Locality Breakdown (Tự thích ứng 4 cấp theo Bảng 3 bài báo Facebook hoặc 3 cấp phẳng)
     ax3 = axes[1, 0]
     locality_counts = df["locality"].value_counts()
-    colors = ["#3498db", "#e67e22", "#9b59b6"]
+    colors = ["#2ecc71", "#3498db", "#e67e22", "#9b59b6", "#e74c3c"]
     wedges, texts, autotexts = ax3.pie(
         locality_counts.values, 
         labels=locality_counts.index, 
         autopct="%1.2f%%",
         startangle=140, 
         colors=colors[:len(locality_counts)],
-        explode=[0.05] * len(locality_counts),
+        explode=[0.04] * len(locality_counts),
         textprops=dict(fontweight="bold")
     )
     for at in autotexts:
         at.set_color("white")
-    ax3.set_title("Phân bố Không gian Luồng (Locality)", fontsize=11, fontweight="bold")
+    ax3.set_title("Phân bố Không gian Luồng (Traffic Locality)", fontsize=11, fontweight="bold")
     
     # 4. Hop Count Distribution
     ax4 = axes[1, 1]
     hop_counts = df["hop_count"].value_counts().sort_index()
-    x_labels = [f"{int(h)} Hop\n(ToR/Intra)" if h == 1 else f"{int(h)} Hops\n(Inter-Rack)" for h in hop_counts.index]
-    bars = ax4.bar(x_labels, hop_counts.values, color=["#1abc9c", "#e74c3c"], width=0.45, edgecolor="#333")
+    x_labels = [f"{int(h)} Hop" if h == 1 else f"{int(h)} Hops" for h in hop_counts.index]
+    bar_colors = sns.color_palette("Blues_r", len(hop_counts))
+    bars = ax4.bar(x_labels, hop_counts.values, color=bar_colors, width=0.45, edgecolor="#333")
     for bar in bars:
         h = bar.get_height()
         ax4.text(bar.get_x() + bar.get_width()/2., h + len(df)*0.01, f"{h:,}\n({h/len(df)*100:.1f}%)", 
                  ha="center", va="bottom", fontsize=10, fontweight="bold")
-    ax4.set_ylim(0, max(hop_counts.values) * 1.15)
+    ax4.set_ylim(0, max(hop_counts.values) * 1.15 if len(hop_counts) > 0 else 10)
     ax4.set_title("Phân phối Số chặng Switch (Hop Count)", fontsize=11, fontweight="bold")
     ax4.set_ylabel("Số lượng luồng", fontsize=10)
     ax4.grid(True, axis="y", ls=":", alpha=0.6)
@@ -138,35 +152,50 @@ def plot_device_resources():
     
     switches['tier'] = switches['node_name'].apply(get_switch_tier)
     
+    topo_cfg_path = os.path.join(os.path.dirname(__file__), "topology_config.json")
+    tcam_cap = 1000
+    if os.path.exists(topo_cfg_path):
+        try:
+            with open(topo_cfg_path, "r", encoding="utf-8") as tf:
+                tcam_cap = json.load(tf).get("switches", {}).get("tcam_capacity_rules", 1000)
+        except Exception:
+            pass
+
     fig, axes = plt.subplots(2, 2, figsize=(15, 11))
     
     # 1. Switch RAM by Tier
     ax1 = axes[0, 0]
-    sns.boxplot(data=switches, x='tier', y='memory_usage_mb', palette=['#3498db', '#f39c12', '#9b59b6'], ax=ax1)
+    sns.boxplot(data=switches, x='tier', y='memory_usage_mb', hue='tier', legend=False, palette=['#3498db', '#f39c12', '#9b59b6'], ax=ax1)
     ax1.set_title("RAM Sử Dụng theo Tầng Switch (Two-Phase Attribution)", fontsize=11, fontweight="bold")
     ax1.set_xlabel("Phân tầng Switch", fontsize=10)
     ax1.set_ylabel("RAM sử dụng (MB)", fontsize=10)
     ax1.grid(True, ls=":", alpha=0.6)
     
-    # 2. TCAM Entries by Switch
+    # 2. TCAM Entries & Usage (%) by Switch
     ax2 = axes[0, 1]
     tcam_avg = switches.groupby('node_name')['tcam_entries'].mean().reset_index()
+    tcam_avg['tcam_pct'] = (tcam_avg['tcam_entries'] / tcam_cap) * 100.0
     # Sắp xếp theo Access, Agg, Core
     order = [f'a{i}' for i in range(1, 9)] + [f'ag{i}' for i in range(1, 5)] + ['c1', 'c2']
     tcam_avg['order'] = tcam_avg['node_name'].map(lambda x: order.index(x) if x in order else 99)
     tcam_avg = tcam_avg.sort_values('order')
     
     bar_colors = ['#3498db']*8 + ['#f39c12']*4 + ['#9b59b6']*2
-    ax2.bar(tcam_avg['node_name'], tcam_avg['tcam_entries'], color=bar_colors, edgecolor="#333", width=0.6)
-    ax2.set_title("Số lượng Luật Bảng TCAM Trung bình trên mỗi Switch", fontsize=11, fontweight="bold")
+    bars = ax2.bar(tcam_avg['node_name'], tcam_avg['tcam_entries'], color=bar_colors, edgecolor="#333", width=0.6)
+    for bar, pct in zip(bars, tcam_avg['tcam_pct']):
+        h = bar.get_height()
+        ax2.text(bar.get_x() + bar.get_width()/2., h + 1.5, f"{int(h)}\n({pct:.1f}%)", 
+                 ha="center", va="bottom", fontsize=8, fontweight="bold")
+    ax2.set_ylim(0, max(tcam_avg['tcam_entries'].max() * 1.35, 60))
+    ax2.set_title(f"Tài nguyên TCAM Switch & Tỷ lệ Sử dụng % (Dung lượng: {tcam_cap:,} Rules)", fontsize=11, fontweight="bold")
     ax2.set_xlabel("Tên Switch (Xanh: Access, Cam: Aggregation, Tím: Core)", fontsize=10)
-    ax2.set_ylabel("Số lượng Flow Entries", fontsize=10)
+    ax2.set_ylabel("Số lượng Flow Entries (và % TCAM)", fontsize=10)
     ax2.tick_params(axis='x', rotation=45)
     ax2.grid(True, axis="y", ls=":", alpha=0.6)
     
     # 3. Switch CPU Boxplot by Tier
     ax3 = axes[1, 0]
-    sns.barplot(data=switches, x='tier', y='cpu_percent', palette=['#3498db', '#f39c12', '#9b59b6'], ax=ax3, ci=None)
+    sns.barplot(data=switches, x='tier', y='cpu_percent', hue='tier', legend=False, palette=['#3498db', '#f39c12', '#9b59b6'], ax=ax3, errorbar=None)
     ax3.set_title("CPU Trung bình (%) theo Tầng Switch", fontsize=11, fontweight="bold")
     ax3.set_xlabel("Phân tầng Switch", fontsize=10)
     ax3.set_ylabel("CPU (%)", fontsize=10)
@@ -207,7 +236,7 @@ def plot_link_utilization():
     
     # 1. Utilization by Link Type
     ax1 = axes[0]
-    sns.boxplot(data=df, x='link_type', y='utilization_pct', palette='Set2', ax=ax1, showfliers=False)
+    sns.boxplot(data=df, x='link_type', y='utilization_pct', hue='link_type', legend=False, palette='Set2', ax=ax1, showfliers=False)
     ax1.set_title("Phân phối Mức tải Liên kết (%) theo Loại Đường truyền", fontsize=11, fontweight="bold")
     ax1.set_xlabel("Loại đường truyền", fontsize=10)
     ax1.set_ylabel("Mức tải - Utilization (%)", fontsize=10)

@@ -40,9 +40,11 @@ struct flow_stats_t {
     u64 start_ktime_ns;
     u64 last_ktime_ns;
     u64 fct_us;             /* Flow Completion Time (micro-giây) */
+    u64 ce_packets;         /* Số gói tin bị đánh dấu Congestion Experienced (CE = 0x03) */
     u8  is_syn;
     u8  is_fin_rst;
-    u8  pad[6];
+    u8  last_ecn_bits;      /* 2 bit ECN mới nhất (00: Non-ECT, 01/10: ECT, 11: CE) */
+    u8  pad[5];
 };
 
 /* Cấu trúc sự kiện Microburst gửi lên Userspace */
@@ -54,6 +56,7 @@ struct microburst_event_t {
     u64 bytes_in_window;
     u64 packets_in_window;
     u64 instantaneous_rate_mbps;
+    u64 ce_packets_in_window; /* Số gói CE ghi nhận trong cửa sổ burst */
 };
 
 /* Cấu trúc cửa sổ trượt từng giao diện mạng */
@@ -61,6 +64,7 @@ struct burst_window_t {
     u64 window_start_ns;
     u64 bytes;
     u64 packets;
+    u64 ce_packets;
 };
 
 /* Bảng thống kê tài nguyên từng switch OVS */
@@ -113,12 +117,14 @@ int xdp_ingress_telemetry(struct xdp_md *ctx) {
     if (eth->h_proto != bpf_htons(ETH_P_IP))
         return XDP_PASS; /* Chỉ đo lường gói IPv4 */
 
-    /* 2. Phân tích IPv4 Header */
+    /* 2. Phân tích IPv4 Header & Bit cờ ECN (RFC 3168 / RFC 8257) */
     struct iphdr *ip = (void *)(eth + 1);
     if ((void *)(ip + 1) > data_end)
         return XDP_PASS;
 
     u8 proto = ip->protocol;
+    u8 ecn_bits = ip->tos & 0x03;             /* 2 bit thấp của ToS: 00: Non-ECT, 01/10: ECT, 11: CE */
+    u8 is_ce = (ecn_bits == 0x03) ? 1 : 0;     /* 1 nếu bị switch đánh dấu Congestion Experienced */
     u32 src_ip = bpf_ntohl(ip->saddr);
     u32 dst_ip = bpf_ntohl(ip->daddr);
     u16 src_port = 0;
@@ -164,6 +170,10 @@ int xdp_ingress_telemetry(struct xdp_md *ctx) {
         fstats->bytes += pkt_len;
         fstats->packets += 1;
         fstats->last_ktime_ns = now_ns;
+        fstats->last_ecn_bits = ecn_bits;
+        if (is_ce) {
+            fstats->ce_packets += 1;
+        }
         if (is_fin_rst && fstats->start_ktime_ns > 0) {
             fstats->fct_us = (now_ns - fstats->start_ktime_ns) / 1000ULL;
             fstats->is_fin_rst = 1;
@@ -175,6 +185,10 @@ int xdp_ingress_telemetry(struct xdp_md *ctx) {
         new_fstats.start_ktime_ns = now_ns;
         new_fstats.last_ktime_ns = now_ns;
         new_fstats.is_syn = is_syn;
+        new_fstats.last_ecn_bits = ecn_bits;
+        if (is_ce) {
+            new_fstats.ce_packets = 1;
+        }
         flow_metrics_map.update(&flow_key, &new_fstats);
     }
 
@@ -194,6 +208,7 @@ int xdp_ingress_telemetry(struct xdp_md *ctx) {
                 evt.bytes_in_window = w->bytes;
                 evt.packets_in_window = w->packets;
                 evt.instantaneous_rate_mbps = rate_mbps;
+                evt.ce_packets_in_window = w->ce_packets;
 
                 /* Đẩy sự kiện qua Ring Buffer lên Userspace thời gian thực */
                 burst_events.perf_submit(ctx, &evt, sizeof(evt));
@@ -208,15 +223,20 @@ int xdp_ingress_telemetry(struct xdp_md *ctx) {
             w->window_start_ns = now_ns;
             w->bytes = pkt_len;
             w->packets = 1;
+            w->ce_packets = is_ce ? 1 : 0;
         } else {
             w->bytes += pkt_len;
             w->packets += 1;
+            if (is_ce) {
+                w->ce_packets += 1;
+            }
         }
     } else {
         struct burst_window_t init_w = {};
         init_w.window_start_ns = now_ns;
         init_w.bytes = pkt_len;
         init_w.packets = 1;
+        init_w.ce_packets = is_ce ? 1 : 0;
         burst_window_map.update(&ifindex, &init_w);
     }
 

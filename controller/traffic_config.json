@@ -15,14 +15,33 @@
     "note": "Hệ số giãn nhịp D_arrival = CPU_paper / CPU_host (tự động đồng bộ số core cấp cho host từ topology_config.json)."
   },
   "flow_threshold": {
-    "S_threshold_bytes": 124225,
-    "note": "Ngưỡng phân tách luồng Voi/Chuột. Cập nhật tự động sau phân tích Pareto P90."
+    "S_threshold_bytes": 65536,
+    "note": "Ngưỡng phân tách luồng Voi/Chuột chuẩn Presto (64 KB). Luồng <= 64KB giữ nguyên 100%, luồng > 64KB co giãn liên tục theo alpha = 0.01."
   },
   "destination_locality": {
-    "r_intra_rack": 0.072,
-    "r_extra_rack": 0.85,
-    "r_extra_dc": 0.078,
-    "note": "Phân bổ 3 vùng theo Bảng 3 bài báo Facebook: 7.2% cùng rack, 85.0% xuyên rack DCN, 7.8% ra ngoài Internet (node inet)."
+    "clustered": {
+      "r_intra_rack": 0.129,
+      "r_intra_cluster": 0.575,
+      "r_intra_dc": 0.119,
+      "r_extra_dc": 0.177,
+      "note": "Phân bổ 4 cấp độ theo Bảng 3 bài báo Facebook (khi topo có chia Cluster): 12.9% Intra-Rack, 57.5% Intra-Cluster, 11.9% Intra-DC, 17.7% Extra-DC."
+    },
+    "flat": {
+      "r_intra_rack": 0.072,
+      "r_extra_rack": 0.85,
+      "r_extra_dc": 0.078,
+      "note": "Phân bổ 3 cấp độ fallback khi topology không chia Cluster."
+    }
+  },
+  "concurrency": {
+    "max_workers": "ref:topology_config.json#/hosts/total_hosts",
+    "min_burst_ratio": 0.25,
+    "max_burst_ratio": 1.0,
+    "note": "Quản trị tải bùng phát đa luồng (Incast Burst): min_burst = 25% số host, max_burst = 100% số host. Đẩy đồng thời qua ThreadPoolExecutor (max_workers ánh xạ trực tiếp từ tổng số host trong topology_config.json)."
+  },
+  "cache_protocol": {
+    "udp_ratio": 0.184,
+    "note": "18.4% luồng thuộc phân vùng Cache (Memcached) được phát qua UDP Datagram theo Bảng 3 bài báo Facebook."
   },
   "microburst_settings": {
     "p_burst": 0.02,
@@ -30,6 +49,12 @@
     "burst_size_max_bytes": 81920,
     "target_duration_ms_max": 10.0,
     "note": "Cấu hình bơm Heavy Jitter / Microburst kiểm thử hàng đợi switch (microburst_generator.py)."
+  },
+  "ecn_settings": {
+    "enabled": true,
+    "marking_threshold_k_bytes": 30000,
+    "limit_bytes": 1500000,
+    "note": "Ngưỡng đánh dấu CE (Congestion Experienced) K = 30 KB (~20 pkts) tại hàng đợi switch OVS theo RFC 8257 DCTCP / RFC 3168."
   },
   "network_runtime": {
     "iperf_ports": [

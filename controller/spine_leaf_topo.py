@@ -39,6 +39,28 @@ def load_config():
     return {}
 
 
+def load_ecn_settings():
+    """Nạp cấu hình ECN ưu tiên từ traffic_config.json (nơi quản trị tập trung) với fallback an toàn."""
+    traffic_file = os.path.join(os.path.dirname(__file__), "traffic_config.json")
+    if os.path.exists(traffic_file):
+        try:
+            with open(traffic_file, "r", encoding="utf-8") as tf:
+                tdata = json.load(tf)
+                if "ecn_settings" in tdata:
+                    return tdata["ecn_settings"]
+        except Exception:
+            pass
+    ecn_raw = cfg.get("ecn", {})
+    k_val = ecn_raw.get("marking_threshold_k_bytes", 30000)
+    if isinstance(k_val, str) and k_val.startswith("ref:"):
+        k_val = 30000
+    return {
+        "enabled": True,
+        "marking_threshold_k_bytes": int(k_val),
+        "limit_bytes": 1500000
+    }
+
+
 cfg = load_config()
 
 # 1. Controller settings
@@ -193,15 +215,30 @@ def build_docker_dcn():
     for c_sw in core_switches:
         net.addLink(c_sw, inet_host, bw=BW_CORE_INET, delay=LINK_DELAY, max_queue_size=MAX_QUEUE)
 
-    # Core <-> Aggregation (Full-mesh giữa Core và Aggregation)
+    # Core <-> Aggregation (Toàn bộ Aggregation nối lên Core Switches)
     for ag_sw in agg_switches:
         for c_sw in core_switches:
             net.addLink(c_sw, ag_sw, bw=BW_CORE_AGG, delay=LINK_DELAY, max_queue_size=MAX_QUEUE)
 
-    # Aggregation <-> Access (Mỗi Access nối lên toàn bộ Aggregation)
-    for a_sw in access_switches:
-        for ag_sw in agg_switches:
-            net.addLink(ag_sw, a_sw, bw=BW_AGG_ACC, delay=LINK_DELAY, max_queue_size=MAX_QUEUE)
+    # Aggregation <-> Access: Tự động nhận diện cấu hình Cụm (Cluster-Aware)
+    clusters_cfg = cfg.get("clusters", {})
+    is_clustered = clusters_cfg.get("enabled", False)
+
+    if is_clustered:
+        info("[*] Cấu hình Cụm (Cluster-Aware): Thiết lập liên kết theo 2 Cụm Facebook (Hình 1)...\n")
+        sw_name_map = {sw.name: sw for sw in (agg_switches + access_switches)}
+        for cl_key in ["cluster_1", "cluster_2"]:
+            cl_info = clusters_cfg.get(cl_key, {})
+            cl_aggs = [sw_name_map[name] for name in cl_info.get("aggregation_switches", []) if name in sw_name_map]
+            cl_access = [sw_name_map[name] for name in cl_info.get("access_switches", []) if name in sw_name_map]
+            for a_sw in cl_access:
+                for ag_sw in cl_aggs:
+                    net.addLink(ag_sw, a_sw, bw=BW_AGG_ACC, delay=LINK_DELAY, max_queue_size=MAX_QUEUE)
+    else:
+        info("[*] Cấu hình Phẳng (Flat Mesh): Thiết lập liên kết Full-Mesh giữa toàn bộ Access và Aggregation...\n")
+        for a_sw in access_switches:
+            for ag_sw in agg_switches:
+                net.addLink(ag_sw, a_sw, bw=BW_AGG_ACC, delay=LINK_DELAY, max_queue_size=MAX_QUEUE)
 
     # Access <-> Docker Hosts (Mỗi Rack có HOSTS_PER_RACK hosts cắm vào switch Access a{r} tương ứng)
     for r_idx, a_sw in enumerate(access_switches):
@@ -230,6 +267,20 @@ def build_docker_dcn():
             a_sw.cmd(f"ip addr add {proxy_ip} dev {PROXY_PORT_NAME}")
             a_sw.cmd(f"ip link set dev {PROXY_PORT_NAME} up")
             info(f"    - Switch {sw_name}: Cổng '{PROXY_PORT_NAME}' sẵn sàng (IP: {proxy_ip})\n")
+
+    # Bước 5.2: Kích hoạt ECN (Explicit Congestion Notification) & Ngưỡng đánh dấu K
+    ecn_cfg = load_ecn_settings()
+    if ecn_cfg.get("enabled", True):
+        k_bytes = int(ecn_cfg.get("marking_threshold_k_bytes", 30000))
+        info(f"[*] Bước 5.2: Kích hoạt ECN trên Hosts (tcp_ecn=1) và cấu hình RED/ECN (K={k_bytes} B) quản trị từ traffic_config.json...\n")
+        for h_name, h_obj in hosts.items():
+            h_obj.cmd("sysctl -w net.ipv4.tcp_ecn=1")
+        inet_host.cmd("sysctl -w net.ipv4.tcp_ecn=1")
+
+        for sw in access_switches + agg_switches:
+            for intf in sw.intfList():
+                if intf.name != "lo" and PROXY_PORT_NAME not in intf.name:
+                    sw.cmd(f"tc qdisc add dev {intf.name} parent 5:1 handle 10: red limit 1500000 min {k_bytes} max {k_bytes + 5000} avpkt 1500 burst 25 ecn probability 1.0 2>/dev/null || true")
 
     info("[+] Đang đợi 2s để Ryu Controller quét cấu trúc liên kết qua LLDP...\n")
     time.sleep(2)

@@ -1,0 +1,1600 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SDN KLTN - Interactive Code Architecture Explorer</title>
+  <style>
+    :root {
+      --bg-main: #0b1120;
+      --bg-panel: #131c31;
+      --bg-card: #1e293b;
+      --border-color: #334155;
+      --text-main: #f8fafc;
+      --text-muted: #94a3b8;
+      --accent-cyan: #06b6d4;
+      --accent-blue: #3b82f6;
+      --accent-emerald: #10b981;
+      --accent-purple: #a855f7;
+      --accent-amber: #f59e0b;
+      --accent-rose: #f43f5e;
+    }
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      user-select: none;
+    }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      background-color: var(--bg-main);
+      color: var(--text-main);
+      overflow: hidden;
+      width: 100vw;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+    /* Top Header Bar */
+    header {
+      height: 58px;
+      background-color: var(--bg-panel);
+      border-bottom: 1px solid var(--border-color);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 20px;
+      z-index: 20;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .brand-logo {
+      width: 32px;
+      height: 32px;
+      background: linear-gradient(135deg, #0284c7, #8b5cf6);
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: bold;
+      color: white;
+      font-size: 18px;
+    }
+    .brand-title {
+      font-size: 16px;
+      font-weight: 700;
+      letter-spacing: 0.3px;
+    }
+    .brand-subtitle {
+      font-size: 11px;
+      color: var(--text-muted);
+    }
+    .header-controls {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+    /* Search Box */
+    .search-box {
+      position: relative;
+    }
+    .search-box input {
+      background-color: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      padding: 6px 14px 6px 34px;
+      color: var(--text-main);
+      font-size: 13px;
+      width: 240px;
+      outline: none;
+      transition: all 0.2s ease;
+    }
+    .search-box input:focus {
+      border-color: var(--accent-cyan);
+      box-shadow: 0 0 0 3px rgba(6, 182, 212, 0.15);
+      width: 280px;
+    }
+    .search-icon {
+      position: absolute;
+      left: 10px;
+      top: 50%;
+      transform: translateY(-50%);
+      color: var(--text-muted);
+      font-size: 14px;
+    }
+    /* Subsystem Filter Pills */
+    .filter-pills {
+      display: flex;
+      gap: 6px;
+      overflow-x: auto;
+      max-width: 650px;
+    }
+    .pill {
+      padding: 4px 10px;
+      border-radius: 6px;
+      font-size: 12px;
+      cursor: pointer;
+      background-color: var(--bg-card);
+      border: 1px solid var(--border-color);
+      color: var(--text-muted);
+      transition: all 0.15s ease;
+      white-space: nowrap;
+    }
+    .pill:hover {
+      color: var(--text-main);
+      border-color: var(--accent-blue);
+    }
+    .pill.active {
+      background-color: #0284c7;
+      color: white;
+      border-color: #38bdf8;
+      font-weight: 600;
+    }
+    /* Main Content Area */
+    .workspace {
+      position: relative;
+      flex: 1;
+      width: 100%;
+      height: calc(100vh - 58px);
+      overflow: hidden;
+      cursor: grab;
+    }
+    .workspace:active {
+      cursor: grabbing;
+    }
+    svg#canvas {
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+    /* Floating Toolbar */
+    .toolbar {
+      position: absolute;
+      bottom: 24px;
+      right: 24px;
+      background-color: rgba(19, 28, 49, 0.85);
+      backdrop-filter: blur(8px);
+      border: 1px solid var(--border-color);
+      border-radius: 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      padding: 6px;
+      z-index: 10;
+      box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.5);
+    }
+    .tool-btn {
+      width: 38px;
+      height: 38px;
+      border-radius: 8px;
+      background: transparent;
+      border: none;
+      color: var(--text-main);
+      font-size: 16px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+    .tool-btn:hover {
+      background-color: var(--bg-card);
+      color: var(--accent-cyan);
+    }
+    /* Minimap Radar */
+    .minimap-container {
+      position: absolute;
+      bottom: 24px;
+      left: 24px;
+      width: 200px;
+      height: 140px;
+      background-color: rgba(19, 28, 49, 0.85);
+      backdrop-filter: blur(8px);
+      border: 1px solid var(--border-color);
+      border-radius: 10px;
+      z-index: 10;
+      overflow: hidden;
+      box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.5);
+    }
+    .minimap-header {
+      font-size: 10px;
+      text-transform: uppercase;
+      font-weight: 700;
+      color: var(--text-muted);
+      padding: 4px 8px;
+      background-color: rgba(0, 0, 0, 0.2);
+    }
+    svg#minimap {
+      width: 100%;
+      height: 115px;
+    }
+    .minimap-view-rect {
+      fill: rgba(6, 182, 212, 0.2);
+      stroke: var(--accent-cyan);
+      stroke-width: 1.5;
+    }
+    /* Node Inspector Drawer */
+    .inspector {
+      position: absolute;
+      top: 0;
+      right: -420px;
+      width: 400px;
+      height: 100%;
+      background-color: var(--bg-panel);
+      border-left: 1px solid var(--border-color);
+      box-shadow: -10px 0 30px rgba(0, 0, 0, 0.5);
+      z-index: 30;
+      transition: right 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+      display: flex;
+      flex-direction: column;
+      overflow-y: auto;
+    }
+    .inspector.open {
+      right: 0;
+    }
+    .inspector-header {
+      padding: 20px;
+      border-bottom: 1px solid var(--border-color);
+      position: relative;
+    }
+    .inspector-close {
+      position: absolute;
+      top: 18px;
+      right: 18px;
+      background: transparent;
+      border: none;
+      color: var(--text-muted);
+      font-size: 20px;
+      cursor: pointer;
+    }
+    .inspector-close:hover {
+      color: var(--text-main);
+    }
+    .badge-subsystem {
+      display: inline-block;
+      padding: 3px 8px;
+      border-radius: 4px;
+      font-size: 11px;
+      font-weight: 600;
+      margin-bottom: 8px;
+    }
+    .inspector-title {
+      font-size: 18px;
+      font-weight: 700;
+      margin-bottom: 6px;
+      word-break: break-all;
+    }
+    .inspector-path {
+      font-family: monospace;
+      font-size: 12px;
+      color: var(--text-muted);
+      background-color: var(--bg-card);
+      padding: 4px 8px;
+      border-radius: 4px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .inspector-path:hover {
+      color: var(--accent-cyan);
+    }
+    .inspector-body {
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+    .section-title {
+      font-size: 12px;
+      text-transform: uppercase;
+      font-weight: 700;
+      color: var(--text-muted);
+      letter-spacing: 0.5px;
+      margin-bottom: 6px;
+    }
+    .spec-list {
+      list-style: none;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .spec-item {
+      background-color: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: 6px;
+      padding: 8px 10px;
+      font-size: 12.5px;
+      line-height: 1.4;
+    }
+    .dep-chip {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      background-color: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: 6px;
+      padding: 8px 12px;
+      font-size: 12.5px;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+    .dep-chip:hover {
+      border-color: var(--accent-cyan);
+      transform: translateX(3px);
+    }
+    /* SVG Node Styling */
+    .node-group {
+      cursor: pointer;
+      transition: opacity 0.2s ease, filter 0.2s ease;
+    }
+    .node-card {
+      fill: #1e293b;
+      stroke: #334155;
+      stroke-width: 1.5;
+      transition: all 0.2s ease;
+    }
+    .node-group:hover .node-card {
+      stroke: var(--accent-cyan);
+      stroke-width: 2.5;
+      filter: drop-shadow(0 0 10px rgba(6, 182, 212, 0.4));
+    }
+    .node-group.active .node-card {
+      stroke: #38bdf8;
+      stroke-width: 3;
+      filter: drop-shadow(0 0 15px rgba(56, 189, 248, 0.6));
+    }
+    .node-group.dimmed {
+      opacity: 0.18;
+    }
+    .node-title {
+      fill: #f8fafc;
+      font-size: 14px;
+      font-weight: 600;
+    }
+    .node-badge {
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+    .node-desc {
+      fill: #94a3b8;
+      font-size: 11px;
+    }
+    /* SVG Edges */
+    .edge-path {
+      fill: none;
+      stroke-width: 2;
+      transition: all 0.2s ease;
+    }
+    .edge-path.highlight {
+      stroke-width: 3.5 !important;
+      filter: drop-shadow(0 0 8px currentColor);
+    }
+    .edge-path.dimmed {
+      opacity: 0.12;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Header -->
+  <header>
+    <div class="brand">
+      <div class="brand-logo">DCN</div>
+      <div>
+        <div class="brand-title">SDN Architecture Explorer & Visualizer</div>
+        <div class="brand-subtitle">Dự án KLTN: Spine-Leaf SDN-AI DCN • Interactive Pipeline Navigator</div>
+      </div>
+    </div>
+
+    <!-- Filter Pills -->
+    <div class="filter-pills" id="filter-pills">
+      <div class="pill active" data-filter="all">🌐 Toàn bộ (All Planes)</div>
+      <div class="pill" data-filter="controller">🎮 Control Plane</div>
+      <div class="pill" data-filter="controller_supply">📦 Supply Tools</div>
+      <div class="pill" data-filter="ml_engine">🧠 AI / DRL</div>
+      <div class="pill" data-filter="nfv_proxy">🧩 NFV Proxy</div>
+      <div class="pill" data-filter="data_plane">⚡ Data Plane</div>
+      <div class="pill" data-filter="results">📈 Datasets</div>
+    </div>
+
+    <!-- Search & Controls -->
+    <div class="header-controls">
+      <div class="search-box">
+        <span class="search-icon">🔍</span>
+        <input type="text" id="search-input" placeholder="Tìm kiếm module, file, specs...">
+      </div>
+    </div>
+  </header>
+
+  <!-- Workspace Canvas -->
+  <div class="workspace" id="workspace">
+    <svg id="canvas">
+      <defs>
+        <!-- Arrowhead Markers -->
+        <marker id="arrow-import" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+          <path d="M 0 1 L 10 5 L 0 9 z" fill="#38bdf8" />
+        </marker>
+        <marker id="arrow-json" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+          <path d="M 0 1 L 10 5 L 0 9 z" fill="#a855f7" />
+        </marker>
+        <marker id="arrow-openflow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+          <path d="M 0 1 L 10 5 L 0 9 z" fill="#06b6d4" />
+        </marker>
+        <marker id="arrow-telemetry" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+          <path d="M 0 1 L 10 5 L 0 9 z" fill="#10b981" />
+        </marker>
+        <marker id="arrow-generic" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+          <path d="M 0 1 L 10 5 L 0 9 z" fill="#94a3b8" />
+        </marker>
+      </defs>
+
+      <g id="viewport-group">
+        <!-- Subsystem Background Boundaries -->
+        <g id="subsystem-layers"></g>
+        <!-- Edges -->
+        <g id="edges-layer"></g>
+        <!-- Nodes -->
+        <g id="nodes-layer"></g>
+      </g>
+    </svg>
+
+    <!-- Floating Zoom Controls -->
+    <div class="toolbar">
+      <button class="tool-btn" id="btn-zoom-in" title="Phóng to (Ctrl + +)">➕</button>
+      <button class="tool-btn" id="btn-zoom-out" title="Thu nhỏ (Ctrl + -)">➖</button>
+      <button class="tool-btn" id="btn-reset" title="Khôi phục 100% (Reset)">⟲</button>
+      <button class="tool-btn" id="btn-fit" title="Thu phóng vừa màn hình (Fit to Screen)">⛶</button>
+    </div>
+
+    <!-- Minimap Radar -->
+    <div class="minimap-container">
+      <div class="minimap-header">Radar Định Hướng</div>
+      <svg id="minimap">
+        <g id="minimap-content"></g>
+        <rect id="minimap-viewport" class="minimap-view-rect" x="0" y="0" width="40" height="30"></rect>
+      </svg>
+    </div>
+
+    <!-- Node Inspector Drawer -->
+    <div class="inspector" id="inspector">
+      <div class="inspector-header">
+        <button class="inspector-close" id="btn-close-inspector">&times;</button>
+        <span class="badge-subsystem" id="insp-badge">Control Plane</span>
+        <h2 class="inspector-title" id="insp-title">controller.py</h2>
+        <div class="inspector-path" id="insp-path" title="Nhấn để sao chép đường dẫn">
+          <span id="insp-path-text">controller/controller.py</span>
+          <span>📋</span>
+        </div>
+      </div>
+      <div class="inspector-body">
+        <div>
+          <div class="section-title">Chức năng & Nhiệm vụ</div>
+          <p id="insp-desc" style="font-size: 13px; line-height: 1.5; color: #cbd5e1;"></p>
+        </div>
+
+        <div>
+          <div class="section-title">Đặc tả Kỹ thuật SDN & Pipeline</div>
+          <ul class="spec-list" id="insp-specs"></ul>
+        </div>
+
+        <div>
+          <div class="section-title">Inbound Dependencies (Được gọi bởi)</div>
+          <div id="insp-inbound" style="display: flex; flex-direction: column; gap: 6px;"></div>
+        </div>
+
+        <div>
+          <div class="section-title">Outbound Dependencies (Gọi / Phụ thuộc vào)</div>
+          <div id="insp-outbound" style="display: flex; flex-direction: column; gap: 6px;"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // Dữ liệu Kiến trúc được nhúng trực tiếp (Zero-Dependency)
+    const DATA = {
+  "nodes": [
+    {
+      "id": "controller_topology_config_json",
+      "label": "topology_config.json",
+      "subsystem": "controller",
+      "subsystem_name": "controller",
+      "type": "json_config",
+      "badge": "Config IaC",
+      "rel_path": "controller/topology_config.json",
+      "doc": "Infrastructure as Code (IaC) Topology Schema",
+      "sdn_specs": [
+        "Định nghĩa 14 OVS switches, 33 containers, băng thông từng liên kết",
+        "Tham chiếu JSON Pointer 2 chiều với traffic_config.json",
+        "Cấu hình ECN threshold K=30,000 bytes"
+      ],
+      "status": "Active",
+      "x": 80,
+      "y": 100
+    },
+    {
+      "id": "controller_traffic_config_json",
+      "label": "traffic_config.json",
+      "subsystem": "controller",
+      "subsystem_name": "controller",
+      "type": "json_config",
+      "badge": "Config IaC",
+      "rel_path": "controller/traffic_config.json",
+      "doc": "Traffic Matrix & Simulation Configuration",
+      "sdn_specs": [
+        "Cấu hình tỷ lệ phân phối cụm (Web 33.3%, Cache 33.3%, Hadoop 33.3%)",
+        "Cấu hình thông số ECN marking, limit bytes và tham chiếu ref:"
+      ],
+      "status": "Active",
+      "x": 80,
+      "y": 240
+    },
+    {
+      "id": "controller_ebpf_telemetry_c",
+      "label": "ebpf_telemetry.c",
+      "subsystem": "controller",
+      "subsystem_name": "controller",
+      "type": "c_ebpf",
+      "badge": "eBPF C Kernel",
+      "rel_path": "controller/ebpf_telemetry.c",
+      "doc": "Kernel-space eBPF / TC Network Filter",
+      "sdn_specs": [
+        "Bắt gói tin tại ingress/egress của Access switches",
+        "Kiểm tra TOS byte: tos & 0x03 == 3 để phát hiện nhãn ECN CE",
+        "Tính toán delta timestamp và kích thước payload trực tiếp trong Kernel",
+        "Đẩy sự kiện lên userspace qua BPF_PERF_OUTPUT buffer"
+      ],
+      "status": "Active",
+      "x": 750,
+      "y": 220
+    },
+    {
+      "id": "controller_analyze_and_label_dataset",
+      "label": "analyze_and_label_dataset.py",
+      "subsystem": "controller",
+      "subsystem_name": "controller",
+      "type": "python",
+      "badge": "Python Module",
+      "rel_path": "controller/analyze_and_label_dataset.py",
+      "doc": "Script Phân tích Phân vị & Chốt Ngưỡng Ground-Truth cho Classifier (Phase 7)",
+      "sdn_specs": [
+        "Mô đun mã nguồn"
+      ],
+      "status": "Active",
+      "x": 100,
+      "y": 950
+    },
+    {
+      "id": "controller_controller",
+      "label": "controller.py",
+      "subsystem": "controller",
+      "subsystem_name": "controller",
+      "type": "python",
+      "badge": "Python Module",
+      "rel_path": "controller/controller.py",
+      "doc": "Ryu SDN Controller (OpenFlow 1.3)",
+      "sdn_specs": [
+        "OpenFlow 1.3 Reactive & Proactive Multi-table Pipeline",
+        "Table 0: Flow classification & bi-flow pairing (Priority 150)",
+        "Table 0: ECN CE-marked flow counting (Priority 60, match ip_ecn=3)",
+        "Table 1: ECMP group table routing (Priority 100, OFPGT_SELECT)",
+        "Elephant Flow Steering: Priority 1000 điều hướng tới cổng proxy-int",
+        "Proxy ARP & Dynamic Host Discovery chống bão Broadcast"
+      ],
+      "status": "Active",
+      "x": 750,
+      "y": 80
+    },
+    {
+      "id": "controller_dcn_flow_engine",
+      "label": "dcn_flow_engine.py",
+      "subsystem": "controller",
+      "subsystem_name": "controller",
+      "type": "python",
+      "badge": "Python Module",
+      "rel_path": "controller/dcn_flow_engine.py",
+      "doc": "High-Performance TCP/UDP Flow Engine",
+      "sdn_specs": [
+        "Socket client/server với cờ TCP_NODELAY và IP_TOS",
+        "Kiểm soát chính xác kích thước burst cấp độ byte"
+      ],
+      "status": "Active",
+      "x": 1150,
+      "y": 400
+    },
+    {
+      "id": "controller_ebpf_loader",
+      "label": "ebpf_loader.py",
+      "subsystem": "controller",
+      "subsystem_name": "controller",
+      "type": "python",
+      "badge": "Python Module",
+      "rel_path": "controller/ebpf_loader.py",
+      "doc": "BCC eBPF Userspace Loader",
+      "sdn_specs": [
+        "Biên dịch và gắn ebpf_telemetry.c vào TC ingress/egress hooks",
+        "Khởi tạo Perf Ring Buffer đọc gói tin nano-second",
+        "Cung cấp giao diện streaming telemetry sang management_plane.py"
+      ],
+      "status": "Active",
+      "x": 750,
+      "y": 360
+    },
+    {
+      "id": "controller_management_plane",
+      "label": "management_plane.py",
+      "subsystem": "controller",
+      "subsystem_name": "controller",
+      "type": "python",
+      "badge": "Python Module",
+      "rel_path": "controller/management_plane.py",
+      "doc": "Comprehensive Telemetry & Management Engine",
+      "sdn_specs": [
+        "Thu thập đồng bộ 10 Features chuẩn: dur, sbytes, dbytes, Spkts, Dpkts, Sload, Dload, smeansz, dmeansz, Ratio",
+        "Multi-threaded Docker stats collector (Zero-timeout lock cache)",
+        "eBPF Ring Buffer poller & event aggregator",
+        "Đo lường chi tiết từng chặng (Hop-by-Hop Path Tracing)",
+        "Ghi 5 tệp CSV Telemetry thời gian thực"
+      ],
+      "status": "Active",
+      "x": 750,
+      "y": 500
+    },
+    {
+      "id": "controller_microburst_generator",
+      "label": "microburst_generator.py",
+      "subsystem": "controller",
+      "subsystem_name": "controller",
+      "type": "python",
+      "badge": "Python Module",
+      "rel_path": "controller/microburst_generator.py",
+      "doc": "Heavy Jitter & Ephemeral Microburst Injector",
+      "sdn_specs": [
+        "Sinh các xung tải chớp nhoáng 20KB - 80KB, thời gian tồn tại < 10ms",
+        "Gắn nhãn ECT-0 (TOS 0x02) kích hoạt cơ chế Fast-Path ECN Marking",
+        "Giải phóng Controller khỏi bão PacketIn theo kiến trúc ADR-001"
+      ],
+      "status": "Active",
+      "x": 1150,
+      "y": 550
+    },
+    {
+      "id": "controller_spine_leaf_topo",
+      "label": "spine_leaf_topo.py",
+      "subsystem": "controller",
+      "subsystem_name": "controller",
+      "type": "python",
+      "badge": "Python Module",
+      "rel_path": "controller/spine_leaf_topo.py",
+      "doc": "Containernet Multi-tier Clos Topology",
+      "sdn_specs": [
+        "2 Core (c1..c2), 4 Agg (ag1..ag4), 8 Access (a1..a8)",
+        "32 Host Containers (4 hosts/rack) + 1 Node Inet ngoài DCN",
+        "Phân bổ cổng chuẩn: Port 1-2 Uplink, Port 3-6 Hosts/Downlink",
+        "Cấu hình Linux ECN: net.ipv4.tcp_ecn = 1 trên tất cả containers",
+        "Cấu hình RED/ECN qdisc trên switch ports với threshold K = 30KB"
+      ],
+      "status": "Active",
+      "x": 400,
+      "y": 120
+    },
+    {
+      "id": "controller_traffic_generator",
+      "label": "traffic_generator.py",
+      "subsystem": "controller",
+      "subsystem_name": "controller",
+      "type": "python",
+      "badge": "Python Module",
+      "rel_path": "controller/traffic_generator.py",
+      "doc": "Facebook DCN Synthetic Traffic Generator",
+      "sdn_specs": [
+        "Mô phỏng workload chuẩn Facebook SIGCOMM 2015 (Web, Cache, Hadoop)",
+        "Tỷ lệ giao thức: 81.6% TCP, 18.4% UDP",
+        "Phân vùng Locality: 12.9% Intra-Rack, 57.5% Intra-Cluster, 11.9% Intra-DC, 17.7% Extra-DC",
+        "Điều phối luồng qua unified_sampler.py và dcn_flow_engine.py"
+      ],
+      "status": "Active",
+      "x": 1150,
+      "y": 100
+    },
+    {
+      "id": "controller_unified_sampler",
+      "label": "unified_sampler.py",
+      "subsystem": "controller",
+      "subsystem_name": "controller",
+      "type": "python",
+      "badge": "Python Module",
+      "rel_path": "controller/unified_sampler.py",
+      "doc": "Blended Inversion CDF Sampler",
+      "sdn_specs": [
+        "Lấy mẫu ngẫu nhiên biến ngẫu nhiên liên tục theo đường phân phối Facebook",
+        "Mô hình thân phân phối Log-Normal + đuôi Pareto Heavy-tail (alpha = 1.05..1.20)",
+        "Chuyển tiếp mượt mà bảo toàn kỳ vọng toán học E[X]"
+      ],
+      "status": "Active",
+      "x": 1150,
+      "y": 250
+    },
+    {
+      "id": "controller_validate_workload_kstest",
+      "label": "validate_workload_kstest.py",
+      "subsystem": "controller",
+      "subsystem_name": "controller",
+      "type": "python",
+      "badge": "Python Module",
+      "rel_path": "controller/validate_workload_kstest.py",
+      "doc": "Kiểm định Thống kê Học thuật Kolmogorov-Smirnov (KS-Test) - Phase 8",
+      "sdn_specs": [
+        "Mô đun mã nguồn"
+      ],
+      "status": "Active",
+      "x": 360,
+      "y": 950
+    },
+    {
+      "id": "controller_visualize_all_results",
+      "label": "visualize_all_results.py",
+      "subsystem": "controller",
+      "subsystem_name": "controller",
+      "type": "python",
+      "badge": "Python Module",
+      "rel_path": "controller/visualize_all_results.py",
+      "doc": "Sinh toàn bộ hệ thống biểu đồ trực quan hóa dữ liệu thực nghiệm chuẩn học thuật",
+      "sdn_specs": [
+        "Mô đun mã nguồn"
+      ],
+      "status": "Active",
+      "x": 620,
+      "y": 950
+    },
+    {
+      "id": "controller_supply_blend_cdfs",
+      "label": "blend_cdfs.py",
+      "subsystem": "controller_supply",
+      "subsystem_name": "controller/supply",
+      "type": "python",
+      "badge": "Python Module",
+      "rel_path": "controller/supply/blend_cdfs.py",
+      "doc": "Hòa trộn toán học 9 file phân phối thực nghiệm từ Facebook (SIGCOMM 2015)",
+      "sdn_specs": [
+        "Mô đun mã nguồn"
+      ],
+      "status": "Active",
+      "x": 880,
+      "y": 950
+    },
+    {
+      "id": "controller_supply_digitize_paper_plots",
+      "label": "digitize_paper_plots.py",
+      "subsystem": "controller_supply",
+      "subsystem_name": "controller/supply",
+      "type": "python",
+      "badge": "Python Module",
+      "rel_path": "controller/supply/digitize_paper_plots.py",
+      "doc": "Số hóa tự động chính xác tuyệt đối 9 đường cong ECDF thực nghiệm",
+      "sdn_specs": [
+        "Mô đun mã nguồn"
+      ],
+      "status": "Active",
+      "x": 1140,
+      "y": 950
+    },
+    {
+      "id": "controller_supply_extract_paper_figures",
+      "label": "extract_paper_figures.py",
+      "subsystem": "controller_supply",
+      "subsystem_name": "controller/supply",
+      "type": "python",
+      "badge": "Python Module",
+      "rel_path": "controller/supply/extract_paper_figures.py",
+      "doc": "Trích xuất các biểu đồ ECDF thực nghiệm từ file PDF bài báo Facebook",
+      "sdn_specs": [
+        "Mô đun mã nguồn"
+      ],
+      "status": "Active",
+      "x": 1400,
+      "y": 950
+    },
+    {
+      "id": "controller_supply_tcp_flow_server",
+      "label": "tcp_flow_server.py",
+      "subsystem": "controller_supply",
+      "subsystem_name": "controller/supply",
+      "type": "python",
+      "badge": "Python Module",
+      "rel_path": "controller/supply/tcp_flow_server.py",
+      "doc": "Multi-threaded TCP Flow Sink Server siêu nhẹ cho các container mạng DCN",
+      "sdn_specs": [
+        "Mô đun mã nguồn"
+      ],
+      "status": "Active",
+      "x": 100,
+      "y": 1070
+    },
+    {
+      "id": "ml_engine_classifier_planned",
+      "label": "ml_engine/classifier/",
+      "subsystem": "ml_engine",
+      "subsystem_name": "ml_engine",
+      "type": "planned",
+      "badge": "⏳ Planned",
+      "rel_path": "ml_engine/classifier/",
+      "doc": "Phân hệ dự kiến phát triển: classifier",
+      "sdn_specs": [
+        "Đang theo lộ trình nghiên cứu đề tài"
+      ],
+      "status": "Planned",
+      "x": 750,
+      "y": 720
+    },
+    {
+      "id": "ml_engine_routing_planned",
+      "label": "ml_engine/routing/",
+      "subsystem": "ml_engine",
+      "subsystem_name": "ml_engine",
+      "type": "planned",
+      "badge": "⏳ Planned",
+      "rel_path": "ml_engine/routing/",
+      "doc": "Phân hệ dự kiến phát triển: routing",
+      "sdn_specs": [
+        "Đang theo lộ trình nghiên cứu đề tài"
+      ],
+      "status": "Planned",
+      "x": 950,
+      "y": 720
+    },
+    {
+      "id": "nfv_proxy_planned",
+      "label": "nfv_proxy/",
+      "subsystem": "nfv_proxy",
+      "subsystem_name": "nfv_proxy",
+      "type": "planned",
+      "badge": "⏳ Planned",
+      "rel_path": "nfv_proxy/",
+      "doc": "Phân hệ dự kiến phát triển: nfv_proxy",
+      "sdn_specs": [
+        "Đang theo lộ trình nghiên cứu đề tài"
+      ],
+      "status": "Planned",
+      "x": 400,
+      "y": 720
+    },
+    {
+      "id": "data_plane_planned",
+      "label": "data_plane/",
+      "subsystem": "data_plane",
+      "subsystem_name": "data_plane",
+      "type": "planned",
+      "badge": "⏳ Planned",
+      "rel_path": "data_plane/",
+      "doc": "Phân hệ dự kiến phát triển: data_plane",
+      "sdn_specs": [
+        "Đang theo lộ trình nghiên cứu đề tài"
+      ],
+      "status": "Planned",
+      "x": 400,
+      "y": 280
+    },
+    {
+      "id": "evaluate_planned",
+      "label": "evaluate/",
+      "subsystem": "evaluate",
+      "subsystem_name": "evaluate",
+      "type": "planned",
+      "badge": "⏳ Planned",
+      "rel_path": "evaluate/",
+      "doc": "Phân hệ dự kiến phát triển: evaluate",
+      "sdn_specs": [
+        "Đang theo lộ trình nghiên cứu đề tài"
+      ],
+      "status": "Planned",
+      "x": 1200,
+      "y": 720
+    },
+    {
+      "id": "results_2026_10_17_22_22_link_utilization_telemetry_csv",
+      "label": "link_utilization_telemetry.csv",
+      "subsystem": "results",
+      "subsystem_name": "results",
+      "type": "csv_dataset",
+      "badge": "Dataset / KPI",
+      "rel_path": "results/2026-10-17_22-22/link_utilization_telemetry.csv",
+      "doc": "Tệp tin dữ liệu Telemetry thực nghiệm",
+      "sdn_specs": [
+        "Lưu trữ định dạng CSV",
+        "Phục vụ huấn luyện AI và đánh giá"
+      ],
+      "status": "Active",
+      "x": 360,
+      "y": 1070
+    },
+    {
+      "id": "results_2026_10_17_22_22_network_evaluation_kpis_csv",
+      "label": "network_evaluation_kpis.csv",
+      "subsystem": "results",
+      "subsystem_name": "results",
+      "type": "csv_dataset",
+      "badge": "Dataset / KPI",
+      "rel_path": "results/2026-10-17_22-22/network_evaluation_kpis.csv",
+      "doc": "Tệp tin dữ liệu Telemetry thực nghiệm",
+      "sdn_specs": [
+        "Lưu trữ định dạng CSV",
+        "Phục vụ huấn luyện AI và đánh giá"
+      ],
+      "status": "Active",
+      "x": 620,
+      "y": 1070
+    },
+    {
+      "id": "results_2026_10_17_22_22_traffic_flow_dataset_with_paths_csv",
+      "label": "traffic_flow_dataset_with_paths.csv",
+      "subsystem": "results",
+      "subsystem_name": "results",
+      "type": "csv_dataset",
+      "badge": "Dataset / KPI",
+      "rel_path": "results/2026-10-17_22-22/traffic_flow_dataset_with_paths.csv",
+      "doc": "Tệp tin dữ liệu Telemetry thực nghiệm",
+      "sdn_specs": [
+        "Lưu trữ định dạng CSV",
+        "Phục vụ huấn luyện AI và đánh giá"
+      ],
+      "status": "Active",
+      "x": 880,
+      "y": 1070
+    }
+  ],
+  "links": [
+    {
+      "source": "controller_analyze_and_label_dataset",
+      "target": "controller_unified_sampler",
+      "type": "import",
+      "label": "imports",
+      "color": "#38bdf8",
+      "style": "dashed"
+    },
+    {
+      "source": "controller_analyze_and_label_dataset",
+      "target": "controller_unified_sampler",
+      "type": "import",
+      "label": "imports",
+      "color": "#38bdf8",
+      "style": "dashed"
+    },
+    {
+      "source": "controller_management_plane",
+      "target": "controller_ebpf_loader",
+      "type": "import",
+      "label": "imports",
+      "color": "#38bdf8",
+      "style": "dashed"
+    },
+    {
+      "source": "controller_management_plane",
+      "target": "controller_ebpf_loader",
+      "type": "import",
+      "label": "imports",
+      "color": "#38bdf8",
+      "style": "dashed"
+    },
+    {
+      "source": "controller_traffic_generator",
+      "target": "controller_unified_sampler",
+      "type": "import",
+      "label": "imports",
+      "color": "#38bdf8",
+      "style": "dashed"
+    },
+    {
+      "source": "controller_traffic_generator",
+      "target": "controller_unified_sampler",
+      "type": "import",
+      "label": "imports",
+      "color": "#38bdf8",
+      "style": "dashed"
+    },
+    {
+      "source": "controller_validate_workload_kstest",
+      "target": "controller_unified_sampler",
+      "type": "import",
+      "label": "imports",
+      "color": "#38bdf8",
+      "style": "dashed"
+    },
+    {
+      "source": "controller_validate_workload_kstest",
+      "target": "controller_unified_sampler",
+      "type": "import",
+      "label": "imports",
+      "color": "#38bdf8",
+      "style": "dashed"
+    },
+    {
+      "source": "controller_topology_config_json",
+      "target": "controller_traffic_config_json",
+      "type": "json_ref",
+      "label": "ref: /ecn_settings/enabled",
+      "color": "#a855f7",
+      "style": "dotted"
+    },
+    {
+      "source": "controller_topology_config_json",
+      "target": "controller_traffic_config_json",
+      "type": "json_ref",
+      "label": "ref: /ecn_settings/marking_threshold_k_bytes",
+      "color": "#a855f7",
+      "style": "dotted"
+    },
+    {
+      "source": "controller_topology_config_json",
+      "target": "controller_traffic_config_json",
+      "type": "json_ref",
+      "label": "ref: /ecn_settings/limit_bytes",
+      "color": "#a855f7",
+      "style": "dotted"
+    },
+    {
+      "source": "controller_traffic_config_json",
+      "target": "controller_topology_config_json",
+      "type": "json_ref",
+      "label": "ref: /links/bandwidth_mbps/access_host",
+      "color": "#a855f7",
+      "style": "dotted"
+    },
+    {
+      "source": "controller_traffic_config_json",
+      "target": "controller_topology_config_json",
+      "type": "json_ref",
+      "label": "ref: /system_info/hardware_reference/server_nic_speed_mbps",
+      "color": "#a855f7",
+      "style": "dotted"
+    },
+    {
+      "source": "controller_traffic_config_json",
+      "target": "controller_topology_config_json",
+      "type": "json_ref",
+      "label": "ref: /hosts/resources/cpus",
+      "color": "#a855f7",
+      "style": "dotted"
+    },
+    {
+      "source": "controller_traffic_config_json",
+      "target": "controller_topology_config_json",
+      "type": "json_ref",
+      "label": "ref: /system_info/hardware_reference/server_physical_cores",
+      "color": "#a855f7",
+      "style": "dotted"
+    },
+    {
+      "source": "controller_spine_leaf_topo",
+      "target": "controller_controller",
+      "type": "openflow",
+      "label": "OpenFlow 1.3 TCP:6653",
+      "color": "#06b6d4",
+      "style": "solid"
+    },
+    {
+      "source": "controller_controller",
+      "target": "controller_management_plane",
+      "type": "rest",
+      "label": "Ryu REST API / Stats",
+      "color": "#3b82f6",
+      "style": "solid"
+    },
+    {
+      "source": "controller_ebpf_telemetry_c",
+      "target": "controller_ebpf_loader",
+      "type": "compile",
+      "label": "Compiled & Loaded",
+      "color": "#f59e0b",
+      "style": "dashed"
+    },
+    {
+      "source": "controller_ebpf_loader",
+      "target": "controller_management_plane",
+      "type": "events",
+      "label": "Ring Buffer Events",
+      "color": "#f97316",
+      "style": "solid"
+    },
+    {
+      "source": "controller_controller",
+      "target": "nfv_proxy_planned",
+      "type": "steer",
+      "label": "Steer Elephant Flow (TCP:proxy-int)",
+      "color": "#eab308",
+      "style": "dashed"
+    },
+    {
+      "source": "controller_controller",
+      "target": "data_plane_planned",
+      "type": "flowmod",
+      "label": "OpenFlow FlowMod Rules",
+      "color": "#14b8a6",
+      "style": "solid"
+    },
+    {
+      "source": "controller_management_plane",
+      "target": "ml_engine_classifier_planned",
+      "type": "dataset",
+      "label": "Dataset Features (Training)",
+      "color": "#ec4899",
+      "style": "solid"
+    }
+  ],
+  "subsystems": [
+    {
+      "id": "controller",
+      "name": "controller",
+      "title": "🎮 TẦNG ĐIỀU KHIỂN & TELEMETRY (controller/)",
+      "plane": "Control & Telemetry Plane",
+      "color": "#0284c7",
+      "bg_color": "#0f2338",
+      "icon": "⚡"
+    },
+    {
+      "id": "controller_supply",
+      "name": "controller/supply",
+      "title": "📦 CÔNG CỤ XỬ LÝ & BỔ TRỢ (controller/supply/)",
+      "plane": "Supply & Data Analysis Tools",
+      "color": "#6366f1",
+      "bg_color": "#181a38",
+      "icon": "📦"
+    },
+    {
+      "id": "ml_engine",
+      "name": "ml_engine",
+      "title": "🧠 TẦNG HỌC MÁY & DRL ROUTING (ml_engine/)",
+      "plane": "AI & DRL Plane",
+      "color": "#9333ea",
+      "bg_color": "#261338",
+      "icon": "🧠"
+    },
+    {
+      "id": "nfv_proxy",
+      "name": "nfv_proxy",
+      "title": "🧩 ỨNG DỤNG NHÚNG NFV PROXY (nfv_proxy/)",
+      "plane": "NFV Slicing Plane",
+      "color": "#d97706",
+      "bg_color": "#2a1c08",
+      "icon": "🧩"
+    },
+    {
+      "id": "data_plane",
+      "name": "data_plane",
+      "title": "⚡ MẶT PHẲNG DỮ LIỆU & HẠ TẦNG (data_plane/)",
+      "plane": "Data Plane & Network Fabric",
+      "color": "#059669",
+      "bg_color": "#0a2618",
+      "icon": "🌐"
+    },
+    {
+      "id": "evaluate",
+      "name": "evaluate",
+      "title": "📊 ĐỐI SÁNH HIỆU NĂNG & BENCHMARK (evaluate/)",
+      "plane": "Evaluation Plane",
+      "color": "#8b5cf6",
+      "bg_color": "#1f1538",
+      "icon": "📊"
+    },
+    {
+      "id": "results",
+      "name": "results",
+      "title": "📈 DATASETS & TELEMETRY OUTPUT (results/)",
+      "plane": "Results & Datasets Plane",
+      "color": "#e11d48",
+      "bg_color": "#2b0d18",
+      "icon": "📈"
+    }
+  ]
+};
+
+    // State Canvas Matrix Pan-Zoom
+    let scale = 0.85;
+    let translateX = 60;
+    let translateY = 40;
+    let isDragging = false;
+    let startX = 0;
+    let startY = 0;
+    let activeNodeId = null;
+
+    const workspace = document.getElementById('workspace');
+    const viewportGroup = document.getElementById('viewport-group');
+    const nodesLayer = document.getElementById('nodes-layer');
+    const edgesLayer = document.getElementById('edges-layer');
+    const inspector = document.getElementById('inspector');
+
+    // Cập nhật ma trận transform SVG
+    function updateTransform() {
+      viewportGroup.setAttribute('transform', `matrix(${scale}, 0, 0, ${scale}, ${translateX}, ${translateY})`);
+      updateMinimapViewport();
+    }
+
+    // Render Nodes & Edges
+    function renderGraph() {
+      nodesLayer.innerHTML = '';
+      edgesLayer.innerHTML = '';
+
+      // 1. Render Edges
+      DATA.links.forEach((link, idx) => {
+        const sourceNode = DATA.nodes.find(n => n.id === link.source);
+        const targetNode = DATA.nodes.find(n => n.id === link.target);
+        if (!sourceNode || !targetNode) return;
+
+        // Tọa độ mép node
+        const sx = sourceNode.x + 230;
+        const sy = sourceNode.y + 40;
+        const tx = targetNode.x;
+        const ty = targetNode.y + 40;
+
+        // Vẽ đường cong Bezier
+        const dx = Math.max(Math.abs(tx - sx) * 0.45, 40);
+        const pathData = `M ${sx} ${sy} C ${sx + dx} ${sy}, ${tx - dx} ${ty}, ${tx} ${ty}`;
+
+        const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+        path.setAttribute('d', pathData);
+        path.setAttribute('class', 'edge-path');
+        path.setAttribute('id', `edge-${idx}`);
+        path.setAttribute('stroke', link.color || '#64748b');
+        if (link.style === 'dashed') path.setAttribute('stroke-dasharray', '6 4');
+        if (link.style === 'dotted') path.setAttribute('stroke-dasharray', '2 3');
+
+        // Marker
+        let marker = 'arrow-generic';
+        if (link.type === 'import') marker = 'arrow-import';
+        else if (link.type === 'json_ref') marker = 'arrow-json';
+        else if (link.type === 'openflow') marker = 'arrow-openflow';
+        else if (link.type === 'events' || link.type === 'write') marker = 'arrow-telemetry';
+        path.setAttribute('marker-end', `url(#${marker})`);
+
+        edgesLayer.appendChild(path);
+      });
+
+      // 2. Render Nodes
+      DATA.nodes.forEach(node => {
+        const g = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+        g.setAttribute('class', 'node-group');
+        g.setAttribute('id', `node-${node.id}`);
+        g.setAttribute('transform', `translate(${node.x}, ${node.y})`);
+
+        const sub = DATA.subsystems.find(s => s.id === node.subsystem) || { color: '#0284c7' };
+
+        // Thẻ Card
+        const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+        rect.setAttribute('class', 'node-card');
+        rect.setAttribute('width', '230');
+        rect.setAttribute('height', '80');
+        rect.setAttribute('rx', '8');
+        rect.setAttribute('ry', '8');
+
+        // Thanh Accent bên trái
+        const bar = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+        bar.setAttribute('x', '0');
+        bar.setAttribute('y', '0');
+        bar.setAttribute('width', '5');
+        bar.setAttribute('height', '80');
+        bar.setAttribute('rx', '4');
+        bar.setAttribute('fill', sub.color);
+
+        // Badge loại module
+        const badge = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+        badge.setAttribute('class', 'node-badge');
+        badge.setAttribute('x', '16');
+        badge.setAttribute('y', '22');
+        badge.setAttribute('fill', sub.color);
+        badge.textContent = node.badge || node.subsystem_name;
+
+        // Tên file
+        const title = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+        title.setAttribute('class', 'node-title');
+        title.setAttribute('x', '16');
+        title.setAttribute('y', '44');
+        title.textContent = node.label.length > 22 ? node.label.substring(0, 20) + '...' : node.label;
+
+        // Tóm tắt chức năng
+        const desc = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+        desc.setAttribute('class', 'node-desc');
+        desc.setAttribute('x', '16');
+        desc.setAttribute('y', '64');
+        const docText = node.doc || '';
+        desc.textContent = docText.length > 28 ? docText.substring(0, 26) + '...' : docText;
+
+        g.appendChild(rect);
+        g.appendChild(bar);
+        g.appendChild(badge);
+        g.appendChild(title);
+        g.appendChild(desc);
+
+        // Click Event -> Mở Inspector
+        g.addEventListener('click', (e) => {
+          e.stopPropagation();
+          selectNode(node.id);
+        });
+
+        nodesLayer.appendChild(g);
+      });
+
+      renderMinimap();
+      updateTransform();
+    }
+
+    // Chọn Node và kích hoạt Inspector
+    function selectNode(nodeId) {
+      activeNodeId = nodeId;
+      const node = DATA.nodes.find(n => n.id === nodeId);
+      if (!node) return;
+
+      const sub = DATA.subsystems.find(s => s.id === node.subsystem) || { color: '#0284c7', title: 'SDN' };
+
+      // Đánh dấu active và highlight luồng
+      document.querySelectorAll('.node-group').forEach(el => {
+        el.classList.remove('active', 'dimmed');
+      });
+      document.querySelectorAll('.edge-path').forEach(el => {
+        el.classList.remove('highlight', 'dimmed');
+      });
+
+      const activeEl = document.getElementById(`node-${nodeId}`);
+      if (activeEl) activeEl.classList.add('active');
+
+      // Tìm các node liên thông
+      const connectedNodeIds = new Set([nodeId]);
+      DATA.links.forEach((link, idx) => {
+        const edgeEl = document.getElementById(`edge-${idx}`);
+        if (link.source === nodeId || link.target === nodeId) {
+          connectedNodeIds.add(link.source);
+          connectedNodeIds.add(link.target);
+          if (edgeEl) edgeEl.classList.add('highlight');
+        } else {
+          if (edgeEl) edgeEl.classList.add('dimmed');
+        }
+      });
+
+      // Làm mờ các node không liên quan
+      DATA.nodes.forEach(n => {
+        if (!connectedNodeIds.has(n.id)) {
+          const el = document.getElementById(`node-${n.id}`);
+          if (el) el.classList.add('dimmed');
+        }
+      });
+
+      // Điền thông tin vào Inspector
+      document.getElementById('insp-badge').textContent = sub.title;
+      document.getElementById('insp-badge').style.backgroundColor = sub.color + '25';
+      document.getElementById('insp-badge').style.color = sub.color;
+      document.getElementById('insp-title').textContent = node.label;
+      document.getElementById('insp-path-text').textContent = node.rel_path;
+      document.getElementById('insp-desc').textContent = node.doc || 'Chưa có mô tả tài liệu chi tiết.';
+
+      // Specs
+      const specsUl = document.getElementById('insp-specs');
+      specsUl.innerHTML = '';
+      (node.sdn_specs || ['Mô đun mã nguồn tiêu chuẩn']).forEach(spec => {
+        const li = document.createElement('li');
+        li.className = 'spec-item';
+        li.innerHTML = `• ${spec}`;
+        specsUl.appendChild(li);
+      });
+
+      // Inbound
+      const inContainer = document.getElementById('insp-inbound');
+      inContainer.innerHTML = '';
+      const inLinks = DATA.links.filter(l => l.target === nodeId);
+      if (inLinks.length === 0) {
+        inContainer.innerHTML = '<span style="font-size:12px;color:#64748b;">(Không có module nào gọi tới)</span>';
+      } else {
+        inLinks.forEach(l => {
+          const src = DATA.nodes.find(n => n.id === l.source);
+          if (!src) return;
+          const chip = document.createElement('div');
+          chip.className = 'dep-chip';
+          chip.innerHTML = `<span>⚡ <b>${src.label}</b></span><span style="font-size:11px;color:#94a3b8;">${l.label}</span>`;
+          chip.onclick = () => selectNode(src.id);
+          inContainer.appendChild(chip);
+        });
+      }
+
+      // Outbound
+      const outContainer = document.getElementById('insp-outbound');
+      outContainer.innerHTML = '';
+      const outLinks = DATA.links.filter(l => l.source === nodeId);
+      if (outLinks.length === 0) {
+        outContainer.innerHTML = '<span style="font-size:12px;color:#64748b;">(Không phụ thuộc vào module nào)</span>';
+      } else {
+        outLinks.forEach(l => {
+          const tgt = DATA.nodes.find(n => n.id === l.target);
+          if (!tgt) return;
+          const chip = document.createElement('div');
+          chip.className = 'dep-chip';
+          chip.innerHTML = `<span>🎯 <b>${tgt.label}</b></span><span style="font-size:11px;color:#94a3b8;">${l.label}</span>`;
+          chip.onclick = () => selectNode(tgt.id);
+          outContainer.appendChild(chip);
+        });
+      }
+
+      inspector.classList.add('open');
+    }
+
+    // Đóng Inspector và bỏ làm mờ
+    function closeInspector() {
+      inspector.classList.remove('open');
+      activeNodeId = null;
+      document.querySelectorAll('.node-group').forEach(el => el.classList.remove('active', 'dimmed'));
+      document.querySelectorAll('.edge-path').forEach(el => el.classList.remove('highlight', 'dimmed'));
+    }
+
+    document.getElementById('btn-close-inspector').addEventListener('click', closeInspector);
+    workspace.addEventListener('click', (e) => {
+      if (e.target.id === 'canvas' || e.target.id === 'workspace') {
+        closeInspector();
+      }
+    });
+
+    // Copy file path
+    document.getElementById('insp-path').addEventListener('click', () => {
+      const text = document.getElementById('insp-path-text').textContent;
+      navigator.clipboard.writeText(text);
+      alert('Đã sao chép đường dẫn: ' + text);
+    });
+
+    // Sự kiện Kéo rê Pan & Cuộn Zoom
+    workspace.addEventListener('mousedown', (e) => {
+      if (e.button !== 0) return;
+      isDragging = true;
+      startX = e.clientX - translateX;
+      startY = e.clientY - translateY;
+    });
+
+    window.addEventListener('mousemove', (e) => {
+      if (!isDragging) return;
+      translateX = e.clientX - startX;
+      translateY = e.clientY - startY;
+      updateTransform();
+    });
+
+    window.addEventListener('mouseup', () => {
+      isDragging = false;
+    });
+
+    // Cuộn chuột để Zoom có tâm tại trỏ chuột
+    workspace.addEventListener('wheel', (e) => {
+      e.preventDefault();
+      const rect = workspace.getBoundingClientRect();
+      const mouseX = e.clientX - rect.left;
+      const mouseY = e.clientY - rect.top;
+
+      const zoomFactor = e.deltaY < 0 ? 1.15 : 0.85;
+      const newScale = Math.min(Math.max(scale * zoomFactor, 0.15), 4.0);
+
+      // Điều chỉnh tâm zoom
+      translateX = mouseX - (mouseX - translateX) * (newScale / scale);
+      translateY = mouseY - (mouseY - translateY) * (newScale / scale);
+      scale = newScale;
+
+      updateTransform();
+    }, { passive: false });
+
+    // Toolbar Buttons
+    document.getElementById('btn-zoom-in').onclick = () => {
+      scale = Math.min(scale * 1.25, 4.0);
+      updateTransform();
+    };
+    document.getElementById('btn-zoom-out').onclick = () => {
+      scale = Math.max(scale * 0.8, 0.15);
+      updateTransform();
+    };
+    document.getElementById('btn-reset').onclick = () => {
+      scale = 0.85;
+      translateX = 60;
+      translateY = 40;
+      updateTransform();
+    };
+    document.getElementById('btn-fit').onclick = () => {
+      fitToScreen();
+    };
+
+    function fitToScreen() {
+      const wsWidth = workspace.clientWidth;
+      const wsHeight = workspace.clientHeight;
+      const maxX = Math.max(...DATA.nodes.map(n => n.x)) + 300;
+      const maxY = Math.max(...DATA.nodes.map(n => n.y)) + 150;
+      
+      const scaleX = wsWidth / maxX;
+      const scaleY = wsHeight / maxY;
+      scale = Math.min(scaleX, scaleY, 1.0) * 0.9;
+      translateX = (wsWidth - maxX * scale) / 2;
+      translateY = 40;
+      updateTransform();
+    }
+
+    // Filter Pills
+    document.querySelectorAll('.filter-pills .pill').forEach(pill => {
+      pill.addEventListener('click', () => {
+        document.querySelectorAll('.filter-pills .pill').forEach(p => p.classList.remove('active'));
+        pill.classList.add('active');
+        const filter = pill.getAttribute('data-filter');
+
+        DATA.nodes.forEach(n => {
+          const el = document.getElementById(`node-${n.id}`);
+          if (!el) return;
+          if (filter === 'all' || n.subsystem === filter) {
+            el.style.display = 'block';
+          } else {
+            el.style.display = 'none';
+          }
+        });
+      });
+    });
+
+    // Realtime Search
+    document.getElementById('search-input').addEventListener('input', (e) => {
+      const term = e.target.value.toLowerCase().trim();
+      if (!term) {
+        document.querySelectorAll('.node-group').forEach(el => el.classList.remove('dimmed'));
+        return;
+      }
+      let matchCount = 0;
+      let firstMatch = null;
+      DATA.nodes.forEach(n => {
+        const el = document.getElementById(`node-${n.id}`);
+        if (!el) return;
+        const text = `${n.label} ${n.doc} ${n.rel_path} ${n.sdn_specs.join(' ')}`.toLowerCase();
+        if (text.includes(term)) {
+          el.classList.remove('dimmed');
+          matchCount++;
+          if (!firstMatch) firstMatch = n;
+        } else {
+          el.classList.add('dimmed');
+        }
+      });
+
+      if (firstMatch && matchCount === 1) {
+        // Auto-center vào node tìm thấy
+        translateX = workspace.clientWidth / 2 - firstMatch.x * scale;
+        translateY = workspace.clientHeight / 2 - firstMatch.y * scale;
+        updateTransform();
+      }
+    });
+
+    // Render Minimap
+    function renderMinimap() {
+      const minimapContent = document.getElementById('minimap-content');
+      minimapContent.innerHTML = '';
+      DATA.nodes.forEach(n => {
+        const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+        rect.setAttribute('x', n.x * 0.1);
+        rect.setAttribute('y', n.y * 0.1);
+        rect.setAttribute('width', 23);
+        rect.setAttribute('height', 8);
+        rect.setAttribute('fill', '#38bdf8');
+        rect.setAttribute('opacity', '0.6');
+        minimapContent.appendChild(rect);
+      });
+    }
+
+    function updateMinimapViewport() {
+      const vRect = document.getElementById('minimap-viewport');
+      if (!vRect) return;
+      const wsW = workspace.clientWidth;
+      const wsH = workspace.clientHeight;
+      const vx = (-translateX / scale) * 0.1;
+      const vy = (-translateY / scale) * 0.1;
+      const vw = (wsW / scale) * 0.1;
+      const vh = (wsH / scale) * 0.1;
+
+      vRect.setAttribute('x', Math.max(vx, 0));
+      vRect.setAttribute('y', Math.max(vy, 0));
+      vRect.setAttribute('width', Math.min(vw, 190));
+      vRect.setAttribute('height', Math.min(vh, 130));
+    }
+
+    // Khởi động
+    renderGraph();
+    window.addEventListener('resize', fitToScreen);
+  </script>
+</body>
+</html>

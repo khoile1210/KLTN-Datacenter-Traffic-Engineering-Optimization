@@ -117,7 +117,8 @@ class EBPFTelemetryManager:
                 "duration_ns": evt.window_duration_ns,
                 "bytes": evt.bytes_in_window,
                 "packets": evt.packets_in_window,
-                "rate_mbps": evt.instantaneous_rate_mbps
+                "rate_mbps": evt.instantaneous_rate_mbps,
+                "ce_packets": getattr(evt, "ce_packets_in_window", 0)
             }
             with self.lock:
                 self.burst_events_log.append(rec)
@@ -247,7 +248,9 @@ class EBPFTelemetryManager:
                     "start_ktime_ns": v.start_ktime_ns,
                     "last_ktime_ns": v.last_ktime_ns,
                     "fct_us": v.fct_us,
-                    "is_fin_rst": bool(v.is_fin_rst)
+                    "is_fin_rst": bool(v.is_fin_rst),
+                    "ce_packets": getattr(v, "ce_packets", 0),
+                    "last_ecn_bits": getattr(v, "last_ecn_bits", 0)
                 }
         except Exception:
             pass

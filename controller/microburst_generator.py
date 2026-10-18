@@ -44,12 +44,13 @@ CSV_HEADERS = [
 
 
 def load_config(config_path=DEFAULT_CONFIG_PATH):
-    """Nạp tham số cấu hình microburst từ traffic_config.json."""
+    """Nạp tham số cấu hình microburst và ecn_settings từ traffic_config.json."""
     defaults = {
         "burst_size_min_bytes": 20480,   # 20 KB
         "burst_size_max_bytes": 81920,   # 80 KB
         "target_duration_ms_max": 10.0,
-        "p_burst": 0.02
+        "p_burst": 0.02,
+        "ecn_k_bytes": 30000
     }
     if os.path.exists(config_path):
         try:
@@ -57,6 +58,9 @@ def load_config(config_path=DEFAULT_CONFIG_PATH):
                 cfg = json.load(f)
                 mb_cfg = cfg.get("microburst_settings", {})
                 defaults.update(mb_cfg)
+                ecn_cfg = cfg.get("ecn_settings", {})
+                if "marking_threshold_k_bytes" in ecn_cfg:
+                    defaults["ecn_k_bytes"] = int(ecn_cfg["marking_threshold_k_bytes"])
         except Exception as e:
             print(f"[!] Cảnh báo nạp file cấu hình: {e}. Sử dụng cấu hình mặc định.")
     return defaults
@@ -90,7 +94,11 @@ def log_ground_truth_record(record, csv_path=GROUND_TRUTH_CSV):
 
 
 def discover_docker_hosts():
-    """Quét và nhận diện container mn.h1 -> mn.h8, mn.inet."""
+    """
+    Quét và nhận diện chính xác các Host containers trong mạng Spine-Leaf:
+    - Chỉ chấp nhận các host nội bộ (h1_1 -> h8_4) và node Internet (inet).
+    - Loại trừ hoàn toàn các switch OVS container (a1..a8, ag1..ag4, c1..c2) có IP proxy-int (10.255.0.x).
+    """
     print("[*] Đang quét Docker container trong topo Spine-Leaf...")
     try:
         docker_ps = subprocess.check_output(
@@ -106,12 +114,18 @@ def discover_docker_hosts():
         c_name = c_name.strip()
         if c_name.startswith("mn."):
             short_name = c_name.replace("mn.", "")
+            # Lọc bỏ switch containers (a1..a8, ag1..ag4, c1..c2)
+            if not (re.match(r"^h\d+_\d+$", short_name) or short_name == "inet"):
+                continue
+
             try:
                 ip_out = subprocess.check_output(
                     f"docker exec {c_name} ip -4 -o addr show",
-                    shell=True
+                    shell=True,
+                    stderr=subprocess.DEVNULL
                 ).decode()
-                match = re.search(r"inet\s+(10\.\d+\.\d+\.\d+)/\d+", ip_out)
+                # Chỉ lấy IP thuộc dải host 10.0.0.x (loại trừ 10.255.0.x của proxy-int)
+                match = re.search(r"inet\s+(10\.0\.0\.\d+)/\d+", ip_out)
                 if match:
                     discovered_hosts[short_name] = {
                         "container_name": c_name,
@@ -185,7 +199,7 @@ print(f'{{dur_ms:.4f}}')
 """
     cmd = ["docker", "exec", src_container, "python3", "-c", client_script]
     try:
-        output = subprocess.check_output(cmd, timeout=5.0).decode().strip()
+        output = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, timeout=5.0).decode().strip()
         dur_ms = float(output)
         return dur_ms
     except Exception:

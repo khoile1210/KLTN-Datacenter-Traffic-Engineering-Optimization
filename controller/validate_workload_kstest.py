@@ -47,7 +47,7 @@ def load_unified_cdf(filename):
     """Nạp file CDF thống nhất từ cdf_profiles/."""
     path = os.path.join(PROFILES_DIR, filename)
     if not os.path.exists(path):
-        raise FileNotFoundError(f"[!] Không tìm thấy file {path}. Hãy chạy blend_cdfs.py trước!")
+        raise FileNotFoundError(f"[!] Không tìm thấy file {path}. Hãy chạy controller/supply/blend_cdfs.py trước!")
     df = pd.read_csv(path)
     return df["value"].values, df["cdf"].values
 
@@ -55,6 +55,7 @@ def load_unified_cdf(filename):
 def main():
     parser = argparse.ArgumentParser(description="Academic Kolmogorov-Smirnov (KS-Test) Validation")
     parser.add_argument("-o", "--output-dir", default=RESULTS_DIR, help="Directory to save output chart and validation report")
+    parser.add_argument("-d", "--dataset", default=None, help="Path to experimental dataset CSV")
     args = parser.parse_args()
 
     output_dir = args.output_dir
@@ -68,19 +69,24 @@ def main():
     print("=" * 80)
 
     # 1. Nạp dữ liệu thực nghiệm từ Dataset
-    if not os.path.exists(DATASET_PATH):
-        print(f"[!] Không tìm thấy file dataset thực nghiệm tại: {DATASET_PATH}")
-        print("[!] Hãy chạy traffic_generator.py và analyze_and_label_dataset.py trước.")
-        sys.exit(1)
+    dataset_path = args.dataset or DATASET_PATH
+    if not os.path.exists(dataset_path):
+        candidate = os.path.join(output_dir, "traffic_flow_dataset_with_paths.csv")
+        if os.path.exists(candidate):
+            dataset_path = candidate
+        else:
+            print(f"[!] Không tìm thấy file dataset thực nghiệm tại: {dataset_path}")
+            print("[!] Hãy chạy traffic_generator.py và analyze_and_label_dataset.py trước.")
+            sys.exit(1)
 
-    df_exp = pd.read_csv(DATASET_PATH)
-    print(f"[*] Đã nạp {len(df_exp):,} mẫu luồng thực nghiệm từ: {DATASET_PATH}")
+    df_exp = pd.read_csv(dataset_path)
+    print(f"[*] Đã nạp {len(df_exp):,} mẫu luồng thực nghiệm từ: {dataset_path}")
 
     # Lấy các biến thực nghiệm
     exp_sbytes = df_exp["sbytes"].dropna().values
     exp_dur = df_exp["dur"].dropna().values
 
-    # 2. Nạp dữ liệu lý thuyết từ Facebook ECDF và chuẩn hóa theo hệ quy chiếu Similitude (20 Mbps)
+    # 2. Nạp dữ liệu lý thuyết từ Facebook ECDF và chuẩn hóa theo hệ quy chiếu Similitude
     fb_fs_val, fb_fs_cdf = load_unified_cdf("cdf_flow_size_unified.csv")
     fb_fd_val, fb_fd_cdf = load_unified_cdf("cdf_flow_duration_unified.csv")
 
@@ -136,10 +142,13 @@ def main():
 
     ax1.plot(fb_fs_val, fb_fs_cdf, label="Facebook Raw (10 Gbps gốc)",
              color="#7f8c8d", linestyle=":", linewidth=1.8, alpha=0.7)
-    ax1.plot(scaled_fb_fs_val, fb_fs_cdf, label="Facebook Target Scaled (20 Mbps mục tiêu)",
+    ax1.plot(scaled_fb_fs_val, fb_fs_cdf, label=f"Facebook Target Scaled ({sampler.c_host:.0f} Mbps mục tiêu)",
              color="#e74c3c", linestyle="--", linewidth=2.5)
     ax1.plot(sort_exp_fs, ecdf_exp_fs, label=f"Containernet Emulation (N={len(sort_exp_fs):,})",
              color="#2980b9", linestyle="-", linewidth=2.0, alpha=0.9)
+    if sampler.s_threshold and sampler.s_threshold > 0:
+        ax1.axvline(x=sampler.s_threshold, color="#8e44ad", linestyle="-.", linewidth=1.8,
+                    label=f"Ngưỡng S_threshold ({sampler.s_threshold/1024:.0f} KB)")
 
     ax1.set_xscale("log")
     ax1.set_xlabel("Kích thước luồng - Flow Size (Bytes) [Thang Log]", fontsize=11, fontweight="bold")

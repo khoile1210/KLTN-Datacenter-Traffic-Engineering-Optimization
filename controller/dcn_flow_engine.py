@@ -60,18 +60,35 @@ def run_server(ports_str):
             except Exception:
                 pass
 
+    def serve_udp_port(p):
+        try:
+            udp_srv = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            udp_srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            udp_srv.bind(("0.0.0.0", p))
+            while True:
+                try:
+                    data, _ = udp_srv.recvfrom(65535)
+                except Exception:
+                    break
+        except Exception:
+            pass
+
     threads = []
     for p in ports:
-        t = threading.Thread(target=serve_port, args=(p,), daemon=True)
-        t.start()
-        threads.append(t)
+        t_tcp = threading.Thread(target=serve_port, args=(p,), daemon=True)
+        t_tcp.start()
+        threads.append(t_tcp)
+
+        t_udp = threading.Thread(target=serve_udp_port, args=(p,), daemon=True)
+        t_udp.start()
+        threads.append(t_udp)
         
-    print(f"[+] DCN Flow Server đã khởi động trên các cổng {ports}")
+    print(f"[+] DCN Flow Server (TCP + UDP) đã khởi động trên các cổng {ports}")
     for t in threads:
         t.join()
 
 
-def run_client(dst_ip, dst_port, total_bytes, bind_ip=None):
+def run_client_tcp(dst_ip, dst_port, total_bytes, bind_ip=None):
     total_bytes = int(total_bytes)
     if total_bytes <= 0:
         return
@@ -86,7 +103,9 @@ def run_client(dst_ip, dst_port, total_bytes, bind_ip=None):
             pass
             
     try:
+        s.settimeout(5.0)
         s.connect((dst_ip, int(dst_port)))
+        s.settimeout(15.0)
         
         dummy_chunk = b"X" * min(CHUNK_SIZE, total_bytes)
         rem = total_bytes
@@ -105,13 +124,49 @@ def run_client(dst_ip, dst_port, total_bytes, bind_ip=None):
             s.recv(1)
         except Exception:
             pass
-    except Exception as e:
+    except Exception:
         pass
     finally:
         try:
             s.close()
         except Exception:
             pass
+
+
+def run_client_udp(dst_ip, dst_port, total_bytes, bind_ip=None):
+    total_bytes = int(total_bytes)
+    if total_bytes <= 0:
+        return
+        
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    if bind_ip:
+        try:
+            s.bind((bind_ip, 0))
+        except Exception:
+            pass
+
+    try:
+        s.settimeout(5.0)
+        rem = total_bytes
+        chunk = b"U" * min(1400, rem)
+        while rem > 0:
+            send_size = min(len(chunk), rem)
+            s.sendto(chunk[:send_size], (dst_ip, int(dst_port)))
+            rem -= send_size
+    except Exception:
+        pass
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
+def run_client(dst_ip, dst_port, total_bytes, bind_ip=None, proto="tcp"):
+    if str(proto).lower() == "udp":
+        run_client_udp(dst_ip, dst_port, total_bytes, bind_ip=bind_ip)
+    else:
+        run_client_tcp(dst_ip, dst_port, total_bytes, bind_ip=bind_ip)
 
 
 def main():
@@ -122,6 +177,7 @@ def main():
     parser.add_argument("-d", "--dest", default=None, help="Địa chỉ IP đích")
     parser.add_argument("-b", "--bytes", type=int, default=1024, help="Kích thước luồng cần truyền (Bytes)")
     parser.add_argument("-B", "--bind", default=None, help="Địa chỉ IP nguồn bind")
+    parser.add_argument("--proto", choices=["tcp", "udp"], default="tcp", help="Giao thức truyền (tcp hoặc udp)")
     
     args = parser.parse_args()
     
@@ -132,7 +188,7 @@ def main():
             print("[!] Thiếu tham số --dest cho client!")
             sys.exit(1)
         port = int(args.ports.split(",")[0])
-        run_client(args.dest, port, args.bytes, bind_ip=args.bind)
+        run_client(args.dest, port, args.bytes, bind_ip=args.bind, proto=args.proto)
     else:
         parser.print_help()
 
