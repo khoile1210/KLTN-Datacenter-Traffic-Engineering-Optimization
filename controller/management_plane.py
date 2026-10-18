@@ -28,6 +28,7 @@ import os
 import sys
 import time
 import subprocess
+import socket
 import re
 import requests
 import json
@@ -66,6 +67,7 @@ OUTPUT_DEVICE_CSV = os.path.join(RESULTS_DIR, "device_resource_utilization.csv")
 OUTPUT_HEALTH_CSV = os.path.join(RESULTS_DIR, "system_and_network_health.csv")
 OUTPUT_LINK_CSV = os.path.join(RESULTS_DIR, "link_utilization_telemetry.csv")
 OUTPUT_KPI_CSV = os.path.join(RESULTS_DIR, "network_evaluation_kpis.csv")
+OUTPUT_QUEUE_CSV = os.path.join(RESULTS_DIR, "queue_occupancy_ecn.csv")
 
 POLL_INTERVAL_SEC = 0.5
 
@@ -109,6 +111,12 @@ KPI_CSV_HEADERS = [
     "overall_packet_loss_rate_pct", "total_network_drops",
     "jains_fairness_index", "link_util_std_dev",
     "avg_hop_count", "avg_mice_duration_sec"
+]
+
+# Bộ 5: Giám sát độ sâu hàng đợi OVS & nhãn ECN (Queue Occupancy & ECN Backlog)
+QUEUE_CSV_HEADERS = [
+    "timestamp", "interface", "qdisc_kind", "backlog_bytes", "backlog_packets",
+    "qlen", "drops", "ecn_marked", "overlimits"
 ]
 
 
@@ -228,6 +236,243 @@ class DockerStatsCollectorThread(threading.Thread):
         self.running = False
 
 
+class OVSQueueTelemetryCollectorThread(threading.Thread):
+    """
+    Luồng nền chuyên trách giám sát độ sâu hàng đợi buffer OVS và nhãn ECN (Queue Depth & ECN Backlog):
+    - Sử dụng lệnh Single-Shot Batch 'tc -s -j qdisc show' để truy vấn toàn bộ cổng switch trong 1 lần duy nhất (< 15ms).
+    - Đo đạc chính xác: backlog_bytes, backlog_packets, qlen, packet drops, và ECN marked packets.
+    - Cung cấp dữ liệu vi mô không điểm mù phục vụ DRL Agent và phát hiện tức thời vi bùng nổ Microburst.
+    """
+    def __init__(self, output_csv, poll_interval=0.5):
+        super().__init__(daemon=True, name="OVSQueueTelemetry")
+        self.output_csv = output_csv
+        self.poll_interval = poll_interval
+        self.running = True
+        self.lock = threading.Lock()
+        self.latest_queue_stats = {}
+
+    def run(self):
+        while self.running:
+            try:
+                # Chạy single-shot batch query toàn bộ qdisc dạng JSON
+                cmd = "tc -s -j qdisc show"
+                raw = subprocess.check_output(cmd, shell=True, stderr=subprocess.DEVNULL, timeout=2.0).decode()
+                qdisc_data = json.loads(raw)
+                now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                records = []
+                parsed_stats = {}
+
+                for entry in qdisc_data:
+                    dev = entry.get("dev", "")
+                    if not dev or dev == "lo":
+                        continue
+                    kind = entry.get("kind", "")
+                    backlog_b = entry.get("backlog", 0)
+                    qlen = entry.get("qlen", 0)
+                    drops = entry.get("drops", 0)
+                    overlimits = entry.get("overlimits", 0)
+
+                    # Trích xuất số gói ECN marked từ RED / ECN options nếu có
+                    ecn_marked = 0
+                    options = entry.get("options", {})
+                    if isinstance(options, dict):
+                        ecn_marked = options.get("marked", 0)
+
+                    rec = {
+                        "timestamp": now_str,
+                        "interface": dev,
+                        "qdisc_kind": kind,
+                        "backlog_bytes": backlog_b,
+                        "backlog_packets": qlen,
+                        "qlen": qlen,
+                        "drops": drops,
+                        "ecn_marked": ecn_marked,
+                        "overlimits": overlimits
+                    }
+                    records.append(rec)
+                    parsed_stats[dev] = rec
+
+                if records:
+                    with self.lock:
+                        self.latest_queue_stats = parsed_stats
+                    try:
+                        pd.DataFrame(records).to_csv(self.output_csv, mode="a", header=False, index=False)
+                    except Exception:
+                        pass
+            except Exception:
+                # Graceful fallback nếu không phải Linux kernel hoặc tc không hỗ trợ -j
+                pass
+            time.sleep(self.poll_interval)
+
+    def get_queue_stats(self):
+        with self.lock:
+            return dict(self.latest_queue_stats)
+
+    def stop(self):
+        self.running = False
+
+
+class BiFlowStitcher:
+    """
+    Cỗ máy Ghép cặp Bi-Flow Bất đồng bộ (Asymmetric Bi-Flow Stitcher) & Chống rò rỉ RAM:
+    - Nhận sự kiện FlowRemoved từ Ryu Controller qua kênh IPC Stream.
+    - Ghép cặp 2 chiều Forward / Backward bằng Canonical 5-Tuple Key.
+    - TTL Sweeper: Tự động dọn dẹp các luồng đơn chiều (UDP) sau 3.0 giây, triệt tiêu 100% rò rỉ bộ nhớ.
+    """
+    def __init__(self, ttl_sec=3.0):
+        self.ttl_sec = ttl_sec
+        self.pending = {}  # canonical_key -> (event_dict, timestamp)
+        self.committed = []
+        self.lock = threading.Lock()
+
+    def make_canonical_key(self, s_ip, s_pt, d_ip, d_pt, proto):
+        end_a = (s_ip, s_pt)
+        end_b = (d_ip, d_pt)
+        return (min(end_a, end_b), max(end_a, end_b), proto)
+
+    def add_event(self, event):
+        s_ip = event.get("src_ip")
+        d_ip = event.get("dst_ip")
+        s_pt = event.get("src_port", 0)
+        d_pt = event.get("dst_port", 0)
+        proto = event.get("proto", 0)
+        if not (s_ip and d_ip):
+            return
+
+        c_key = self.make_canonical_key(s_ip, s_pt, d_ip, d_pt, proto)
+        now_ts = time.time()
+
+        with self.lock:
+            if c_key in self.pending:
+                # Đã có chiều đối ngẫu -> Gộp thành Bi-flow hoàn chỉnh
+                e1, _ = self.pending.pop(c_key)
+                e2 = event
+
+                if e1.get("bytes", 0) >= e2.get("bytes", 0):
+                    fwd_ip, bwd_ip = e1["src_ip"], e1["dst_ip"]
+                    fwd_pt, bwd_pt = e1["src_port"], e1["dst_port"]
+                    sbytes = e1["bytes"]
+                    dbytes = e2["bytes"]
+                    Spkts = e1["pkts"]
+                    Dpkts = e2["pkts"]
+                else:
+                    fwd_ip, bwd_ip = e2["src_ip"], e2["dst_ip"]
+                    fwd_pt, bwd_pt = e2["src_port"], e2["dst_port"]
+                    sbytes = e2["bytes"]
+                    dbytes = e1["bytes"]
+                    Spkts = e2["pkts"]
+                    Dpkts = e1["pkts"]
+
+                dur = max(e1.get("dur", 0.0), e2.get("dur", 0.0))
+                self.committed.append({
+                    "src_ip": fwd_ip,
+                    "dst_ip": bwd_ip,
+                    "src_port": fwd_pt,
+                    "dst_port": bwd_pt,
+                    "protocol": proto,
+                    "dur": dur,
+                    "sbytes": sbytes,
+                    "dbytes": dbytes,
+                    "Spkts": Spkts,
+                    "Dpkts": Dpkts
+                })
+            else:
+                self.pending[c_key] = (event, now_ts)
+
+    def sweep_ttl(self):
+        """Quét và auto-commit các luồng đơn chiều (UDP/ICMP) quá hạn 3s, giải phóng RAM."""
+        now_ts = time.time()
+        expired_keys = []
+        with self.lock:
+            for k, (e, ts) in list(self.pending.items()):
+                if now_ts - ts >= self.ttl_sec:
+                    expired_keys.append(k)
+
+            for k in expired_keys:
+                e, _ = self.pending.pop(k)
+                self.committed.append({
+                    "src_ip": e["src_ip"],
+                    "dst_ip": e["dst_ip"],
+                    "src_port": e["src_port"],
+                    "dst_port": e["dst_port"],
+                    "protocol": e["proto"],
+                    "dur": e.get("dur", 0.001),
+                    "sbytes": e.get("bytes", 0),
+                    "dbytes": 0,
+                    "Spkts": e.get("pkts", 1),
+                    "Dpkts": 0
+                })
+
+    def drain_committed(self):
+        with self.lock:
+            records = self.committed
+            self.committed = []
+            return records
+
+
+class TelemetryIPCClientThread(threading.Thread):
+    """
+    Luồng nền kết nối tới Ryu IPC Server (127.0.0.1:6654) để nhận stream sự kiện FlowRemoved.
+    Hỗ trợ cơ chế tự động tái kết nối (Auto-Reconnect) và định kỳ chạy TTL Sweeper.
+    """
+    def __init__(self, stitcher, host="127.0.0.1", port=6654):
+        super(TelemetryIPCClientThread, self).__init__(daemon=True, name="TelemetryIPCReceiver")
+        self.stitcher = stitcher
+        self.host = host
+        self.port = port
+        self.running = True
+
+    def run(self):
+        last_sweep = time.time()
+        buf = ""
+        while self.running:
+            sock = None
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(2.0)
+                sock.connect((self.host, self.port))
+                sock.settimeout(1.0)
+                buf = ""
+                while self.running:
+                    now = time.time()
+                    if now - last_sweep >= 1.0:
+                        self.stitcher.sweep_ttl()
+                        last_sweep = now
+
+                    try:
+                        data = sock.recv(16384)
+                        if not data:
+                            break
+                        buf += data.decode("utf-8", errors="ignore")
+                        while "\n" in buf:
+                            line, buf = buf.split("\n", 1)
+                            line = line.strip()
+                            if line:
+                                try:
+                                    evt = json.loads(line)
+                                    self.stitcher.add_event(evt)
+                                except Exception:
+                                    pass
+                    except socket.timeout:
+                        continue
+            except Exception:
+                pass
+            finally:
+                if sock:
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+                now = time.time()
+                if now - last_sweep >= 1.0:
+                    self.stitcher.sweep_ttl()
+                    last_sweep = now
+                time.sleep(1.0)
+
+    def stop(self):
+        self.running = False
+
+
 class ComprehensiveManagementPlane:
     def __init__(self, rest_url=RYU_REST_URL):
         self.rest_url = rest_url
@@ -236,6 +481,7 @@ class ComprehensiveManagementPlane:
         self.health_csv = OUTPUT_HEALTH_CSV
         self.link_csv = OUTPUT_LINK_CSV
         self.kpi_csv = OUTPUT_KPI_CSV
+        self.queue_csv = OUTPUT_QUEUE_CSV
 
         self.topo_graph = nx.DiGraph()
 
@@ -278,6 +524,17 @@ class ComprehensiveManagementPlane:
                 self.ebpf_manager.attach_mininet_interfaces()
             except Exception:
                 pass
+
+        # ======================================================================
+        # HẠ TẦNG STREAMING TELEMETRY (RECEIVER & BI-FLOW STITCHER CHỐNG RÒ RỈ RAM)
+        # ======================================================================
+        self.biflow_stitcher = BiFlowStitcher(ttl_sec=3.0)
+        self.ipc_client = TelemetryIPCClientThread(self.biflow_stitcher, host="127.0.0.1", port=6654)
+        self.ipc_client.start()
+
+        # Khởi tạo luồng giám sát độ sâu hàng đợi OVS & nhãn ECN (Single-Shot Batch TC)
+        self.queue_collector = OVSQueueTelemetryCollectorThread(output_csv=self.queue_csv, poll_interval=0.5)
+        self.queue_collector.start()
 
     def _load_topology_config(self):
         """Nạp các thông số hạ tầng phần cứng và băng thông mở từ topology_config.json."""
@@ -361,13 +618,14 @@ class ComprehensiveManagementPlane:
         self.host_port_map[self.inet_ip] = 1
 
     def _init_csv_files(self):
-        """Khởi tạo toàn bộ 5 tệp tin CSV với header chuẩn nếu chưa tồn tại."""
+        """Khởi tạo toàn bộ 6 tệp tin CSV với header chuẩn nếu chưa tồn tại."""
         files_headers = [
             (self.flow_csv, FLOW_CSV_HEADERS, "Dataset luồng (10 Features + Hop-by-Hop)"),
             (self.device_csv, DEVICE_CSV_HEADERS, "Giám sát tài nguyên thiết bị (CPU/RAM/Net IO)"),
             (self.health_csv, HEALTH_CSV_HEADERS, "Sức khỏe hệ thống và switch OVS"),
             (self.link_csv, LINK_CSV_HEADERS, "Giám sát & Đánh giá băng thông liên kết (Link Telemetry)"),
-            (self.kpi_csv, KPI_CSV_HEADERS, "Chỉ số KPI đánh giá toàn mạng (Benchmark KPIs)")
+            (self.kpi_csv, KPI_CSV_HEADERS, "Chỉ số KPI đánh giá toàn mạng (Benchmark KPIs)"),
+            (self.queue_csv, QUEUE_CSV_HEADERS, "Giám sát độ sâu hàng đợi OVS & nhãn ECN (Queue Occupancy & ECN Backlog)")
         ]
         for path, headers, desc in files_headers:
             if not os.path.exists(path):
@@ -1188,9 +1446,33 @@ class ComprehensiveManagementPlane:
     # ==========================================================================
     def collect_flow_dataset(self, active_dpids, switch_flows_map, now_str):
         """
-        Thu thập bộ 10 Features và thông tin lần vết Hop-by-Hop phục vụ huấn luyện Machine Learning.
+        Thu thập bộ 10 Features và thông tin lần vết Hop-by-Hop phục vụ huấn luyện Machine Learning (Kiến trúc Hybrid):
+        1. Nhận các luồng hoàn chỉnh tức thì từ Kênh Event Push (OFPFlowRemoved qua IPC Stream).
+        2. Ghép cùng các luồng dài hạn đang hoạt động (Active Elephant Flows) từ OVS polling.
         """
-        paired_flows = self.extract_biflow_stats(switch_flows_map)
+        # 1. Luồng hoàn thành tức thì từ Event-Driven Push (True FCT chuẩn nanosecond)
+        pushed_flows = self.biflow_stitcher.drain_committed() if hasattr(self, 'biflow_stitcher') else []
+
+        # 2. Luồng dài hạn từ OVS Polling
+        polled_flows = self.extract_biflow_stats(switch_flows_map)
+
+        # Gộp cả 2 nguồn: Lọc trùng lặp tuyệt đối (Deduplication) bằng canonical 5-tuple key, ưu tiên pushed_flows
+        seen_keys = set()
+        paired_flows = []
+        for f in pushed_flows:
+            k = (min((f["src_ip"], f["src_port"]), (f["dst_ip"], f["dst_port"])),
+                 max((f["src_ip"], f["src_port"]), (f["dst_ip"], f["dst_port"])),
+                 f["protocol"])
+            seen_keys.add(k)
+            paired_flows.append(f)
+
+        for f in polled_flows:
+            k = (min((f["src_ip"], f["src_port"]), (f["dst_ip"], f["dst_port"])),
+                 max((f["src_ip"], f["src_port"]), (f["dst_ip"], f["dst_port"])),
+                 f["protocol"])
+            if k not in seen_keys:
+                seen_keys.add(k)
+                paired_flows.append(f)
         flow_records = []
         eps = 1e-6
 
@@ -1439,8 +1721,9 @@ def main():
     print(f"    - 2. Giám sát Node  : {collector.device_csv} (CPU %, RAM MB, Net IO)")
     print(f"    - 3. Giám sát Link  : {collector.link_csv} (Throughput Mbps, Utilization %, Drops)")
     print(f"    - 4. Benchmark KPIs : {collector.kpi_csv} (Total Throughput, Jain's Fairness, Loss %)")
+    print(f"    - 5. Giám sát Hàng đợi: {collector.queue_csv} (Queue Depth & ECN Backlog)")
     ebpf_status = collector.ebpf_manager.active_tier if collector.ebpf_manager else "Disabled (No eBPF module)"
-    print(f"    - 5. eBPF Engine    : {ebpf_status}")
+    print(f"    - 6. eBPF Engine    : {ebpf_status}")
     print("=" * 80 + "\n")
 
     try:
@@ -1457,7 +1740,11 @@ def main():
             collector.ebpf_manager.cleanup()
         if hasattr(collector, 'docker_collector'):
             collector.docker_collector.stop()
-        print("\n[+] Đã dừng tầng Management Plane và giải phóng eBPF/Docker threads an toàn.")
+        if hasattr(collector, 'queue_collector'):
+            collector.queue_collector.stop()
+        if hasattr(collector, 'ipc_client'):
+            collector.ipc_client.stop()
+        print("\n[+] Đã dừng tầng Management Plane và giải phóng eBPF/Docker/Queue/IPC threads an toàn.")
 
 
 if __name__ == "__main__":

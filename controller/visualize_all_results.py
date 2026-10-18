@@ -40,8 +40,28 @@ plt.rcParams['axes.edgecolor'] = '#bdc3c7'
 plt.rcParams['axes.linewidth'] = 0.8
 
 
+def resolve_csv_path(filename):
+    """Tìm file CSV trong RESULTS_DIR hoặc trong thư mục snapshot mới nhất (tránh lỗi khi file đã được gom vào thư mục con)."""
+    direct_path = os.path.join(RESULTS_DIR, filename)
+    if os.path.exists(direct_path):
+        return direct_path
+    # Tìm trong thư mục con mới nhất
+    subdirs = [
+        os.path.join(RESULTS_DIR, d) for d in os.listdir(RESULTS_DIR)
+        if os.path.isdir(os.path.join(RESULTS_DIR, d)) and not d.startswith('.')
+        and d not in ('Excel', 'digitization_verification')
+    ]
+    if subdirs:
+        subdirs.sort(key=os.path.getmtime, reverse=True)
+        for s in subdirs:
+            candidate = os.path.join(s, filename)
+            if os.path.exists(candidate):
+                return candidate
+    return direct_path
+
+
 def plot_traffic_flows():
-    csv_path = os.path.join(RESULTS_DIR, "traffic_flow_dataset_with_paths.csv")
+    csv_path = resolve_csv_path("traffic_flow_dataset_with_paths.csv")
     if not os.path.exists(csv_path):
         print(f"[!] Bỏ qua traffic flows vì không thấy: {csv_path}")
         return
@@ -127,7 +147,7 @@ def plot_traffic_flows():
 
 
 def plot_device_resources():
-    csv_path = os.path.join(RESULTS_DIR, "device_resource_utilization.csv")
+    csv_path = resolve_csv_path("device_resource_utilization.csv")
     if not os.path.exists(csv_path):
         print(f"[!] Bỏ qua device resources vì không thấy: {csv_path}")
         return
@@ -222,7 +242,7 @@ def plot_device_resources():
 
 
 def plot_link_utilization():
-    csv_path = os.path.join(RESULTS_DIR, "link_utilization_telemetry.csv")
+    csv_path = resolve_csv_path("link_utilization_telemetry.csv")
     if not os.path.exists(csv_path):
         print(f"[!] Bỏ qua link utilization vì không thấy: {csv_path}")
         return
@@ -234,10 +254,15 @@ def plot_link_utilization():
         
     fig, axes = plt.subplots(1, 2, figsize=(15, 6))
     
-    # 1. Utilization by Link Type
+    # 1. Utilization by Link Type (Lọc các mẫu hoạt động > 0% để thấy rõ phân bố tải thực tế, tránh bẹp hộp do mẫu rỗi)
     ax1 = axes[0]
-    sns.boxplot(data=df, x='link_type', y='utilization_pct', hue='link_type', legend=False, palette='Set2', ax=ax1, showfliers=False)
-    ax1.set_title("Phân phối Mức tải Liên kết (%) theo Loại Đường truyền", fontsize=11, fontweight="bold")
+    df_active = df[df['utilization_pct'] > 0].copy()
+    if not df_active.empty:
+        sns.boxplot(data=df_active, x='link_type', y='utilization_pct', hue='link_type', legend=False, palette='Set2', ax=ax1, showfliers=True)
+        ax1.set_title("Phân phối Mức tải Liên kết Khi Hoạt động (Tải > 0%)", fontsize=11, fontweight="bold")
+    else:
+        sns.boxplot(data=df, x='link_type', y='utilization_pct', hue='link_type', legend=False, palette='Set2', ax=ax1)
+        ax1.set_title("Phân phối Mức tải Liên kết (%) theo Loại Đường truyền", fontsize=11, fontweight="bold")
     ax1.set_xlabel("Loại đường truyền", fontsize=10)
     ax1.set_ylabel("Mức tải - Utilization (%)", fontsize=10)
     ax1.grid(True, ls=":", alpha=0.6)
@@ -264,7 +289,7 @@ def plot_link_utilization():
 
 
 def plot_network_kpis():
-    csv_path = os.path.join(RESULTS_DIR, "network_evaluation_kpis.csv")
+    csv_path = resolve_csv_path("network_evaluation_kpis.csv")
     if not os.path.exists(csv_path):
         print(f"[!] Bỏ qua KPI vì không thấy: {csv_path}")
         return
@@ -326,7 +351,7 @@ def plot_network_kpis():
 
 
 def plot_microbursts():
-    csv_path = os.path.join(RESULTS_DIR, "microburst_client_ground_truth.csv")
+    csv_path = resolve_csv_path("microburst_client_ground_truth.csv")
     if not os.path.exists(csv_path):
         print(f"[!] Bỏ qua microburst vì không thấy: {csv_path}")
         return
@@ -389,7 +414,7 @@ def create_summary_report():
 1. **`01_traffic_flows_characteristics.png`**:
    - Phân phối ECDF Kích thước luồng (Flow Size) với ngưỡng Elephant 64KB.
    - Histogram thời lượng luồng (Duration / FCT).
-   - Biểu đồ tròn phân bố không gian mạng (Locality: Extra-Rack, Intra-Rack, Extra-DC).
+   - Biểu đồ tròn phân bố không gian mạng 4 phân vùng chuẩn Facebook (Locality: Intra-Cluster, Extra-DC, Intra-DC, Intra-Rack).
    - Biểu đồ cột phân bố số chặng (Hop Count: 1-Hop ToR vs 3-Hops Spine-Leaf).
 
 2. **`02_device_resource_utilization.png`**:

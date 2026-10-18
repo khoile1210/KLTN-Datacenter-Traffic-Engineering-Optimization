@@ -14,6 +14,9 @@ Chạy    : ryu-manager --observe-links controller.py ryu.app.ofctl_rest ryu.app
 import os
 import json
 import time
+import socket
+import threading
+import queue
 from ryu import cfg
 from ryu.base import app_manager
 from ryu.controller import ofp_event
@@ -102,7 +105,15 @@ class MultiTierEcmpController(app_manager.RyuApp):
         # Lưu ánh xạ cổng nội bộ proxy-int của từng switch
         self.proxy_ports = {}
 
-        self.logger.info("[+] Multi-Tier Spine-Leaf Controller (Cải tổ v2) đã khởi động thành công.")
+        # ======================================================================
+        # HẠ TẦNG TELEMETRY SỰ KIỆN THỜI GIAN THỰC (ZERO-BLOCKING IPC STREAMER)
+        # ======================================================================
+        self.telemetry_queue = queue.Queue(maxsize=50000)
+        self.ipc_running = True
+        self.ipc_thread = threading.Thread(target=self._ipc_server_loop, daemon=True, name="RyuTelemetryIPC")
+        self.ipc_thread.start()
+
+        self.logger.info("[+] Multi-Tier Spine-Leaf Controller (Kèm Telemetry Push & Zero-block IPC) đã khởi động thành công.")
 
     # ==========================================================================
     # 1. BẮT TAY SWITCH & ĐỒNG BỘ GROUP TABLE AN TOÀN
@@ -194,7 +205,7 @@ class MultiTierEcmpController(app_manager.RyuApp):
                 self.add_flow(datapath, priority=100, match=m_ip, actions=[parser.OFPActionOutput(host_port)], table_id=1)
                 self.logger.info(f"[+] Cài luật cục bộ trên Switch DPID={dpid} (Table 1) cho Host {ip} -> Port {host_port}")
 
-    def add_flow(self, datapath, priority, match, actions, instructions=None, idle_timeout=0, hard_timeout=0, table_id=0):
+    def add_flow(self, datapath, priority, match, actions, instructions=None, idle_timeout=0, hard_timeout=0, flags=0, table_id=0):
         parser = datapath.ofproto_parser
         ofproto = datapath.ofproto
         if instructions is None:
@@ -206,7 +217,8 @@ class MultiTierEcmpController(app_manager.RyuApp):
             match=match,
             instructions=instructions,
             idle_timeout=idle_timeout,
-            hard_timeout=hard_timeout
+            hard_timeout=hard_timeout,
+            flags=flags
         )
         datapath.send_msg(mod)
 
@@ -390,9 +402,12 @@ class MultiTierEcmpController(app_manager.RyuApp):
             fwd_inst = [parser.OFPInstructionGotoTable(1)]
             bwd_inst = [parser.OFPInstructionGotoTable(1)]
 
-            # Cài đặt với Priority=150 (cao hơn Priority=50 và Priority=0 của Table 0) và idle_timeout=30s
-            self.add_flow(dp, priority=150, match=m_fwd, actions=[], instructions=fwd_inst, idle_timeout=30, table_id=0)
-            self.add_flow(dp, priority=150, match=m_bwd, actions=[], instructions=bwd_inst, idle_timeout=30, table_id=0)
+            # PHÒNG THỦ CHỐNG TRÙNG LẶP: Chỉ Ingress Switch mới kích hoạt cờ OFPFF_SEND_FLOW_REM!
+            # Egress Switch chỉ chuyển tiếp (flags=0) để tránh sinh bản tin FlowRemoved kép
+            is_ingress = (sw_dpid == ingress_dpid)
+            flow_flags = dp.ofproto.OFPFF_SEND_FLOW_REM if is_ingress else 0
+            self.add_flow(dp, priority=150, match=m_fwd, actions=[], instructions=fwd_inst, idle_timeout=2, flags=flow_flags, table_id=0)
+            self.add_flow(dp, priority=150, match=m_bwd, actions=[], instructions=bwd_inst, idle_timeout=2, flags=flow_flags, table_id=0)
 
     def send_arp_reply(self, datapath, port, dst_mac, dst_ip, src_mac, src_ip):
         pkt = packet.Packet()
@@ -419,6 +434,114 @@ class MultiTierEcmpController(app_manager.RyuApp):
             data=pkt.data
         )
         datapath.send_msg(out)
+
+    # ==========================================================================
+    # 3.3. TIẾP NHẬN SỰ KIỆN ĐẨY EVENT_OFP_FLOW_REMOVED & IPC STREAMING DAEMON
+    # ==========================================================================
+    @set_ev_cls(ofp_event.EventOFPFlowRemoved, MAIN_DISPATCHER)
+    def flow_removed_handler(self, ev):
+        """
+        Bộ đón sự kiện đẩy OpenFlow EventOFPFlowRemoved (Zero-Block).
+        Chỉ bóc tách trường raw và đưa vào queue vi mô (< 1µs) để GreenThread Hub không bị nghẽn.
+        """
+        msg = ev.msg
+        dp = msg.datapath
+        dpid = dp.id
+        m = msg.match
+        s_ip = m.get("ipv4_src") or m.get("nw_src")
+        d_ip = m.get("ipv4_dst") or m.get("nw_dst")
+        if not (s_ip and d_ip):
+            return
+
+        proto = int(m.get("ip_proto") or m.get("nw_proto") or 0)
+        s_pt = int(m.get("tcp_src") or m.get("udp_src") or m.get("tp_src") or 0)
+        d_pt = int(m.get("tcp_dst") or m.get("udp_dst") or m.get("tp_dst") or 0)
+
+        # Bù trôi idle_timeout (2.0s) khi bị xóa do hết hạn IDLE_TIMEOUT
+        dur_raw = float(msg.duration_sec) + float(msg.duration_nsec) / 1e9
+        if msg.reason == dp.ofproto.OFPRR_IDLE_TIMEOUT:
+            idle_to = float(msg.idle_timeout) if hasattr(msg, 'idle_timeout') and msg.idle_timeout > 0 else 2.0
+            true_dur = max(dur_raw - idle_to, 0.001)
+        else:
+            true_dur = max(dur_raw, 0.001)
+
+        event_rec = {
+            "type": "FLOW_REMOVED",
+            "dpid": dpid,
+            "src_ip": s_ip,
+            "dst_ip": d_ip,
+            "src_port": s_pt,
+            "dst_port": d_pt,
+            "proto": proto,
+            "bytes": int(msg.byte_count),
+            "pkts": int(msg.packet_count),
+            "dur": round(true_dur, 6),
+            "reason": int(msg.reason),
+            "timestamp": time.time()
+        }
+
+        try:
+            self.telemetry_queue.put_nowait(event_rec)
+        except Exception:
+            # Drop oldest nếu queue chạm ngưỡng maxsize=50000 bảo vệ bộ nhớ
+            pass
+
+    def _ipc_server_loop(self):
+        """
+        Kênh truyền stream sự kiện thời gian thực (Zero-blocking TCP Loopback Socket).
+        Gửi dữ liệu theo định dạng JSON Lines (\n) cho management_plane.py.
+        """
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            srv.bind(("127.0.0.1", 6654))
+            srv.listen(5)
+            srv.setblocking(False)
+            self.logger.info("[+] Telemetry IPC Server đã lắng nghe trên 127.0.0.1:6654")
+        except Exception as e:
+            self.logger.warning(f"[!] Không thể mở cổng IPC 6654: {e}")
+            return
+
+        connected_clients = []
+
+        while self.ipc_running:
+            try:
+                conn, _ = srv.accept()
+                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                conn.setblocking(True)
+                connected_clients.append(conn)
+                self.logger.info(f"[+] Client Telemetry đã kết nối tới IPC Server (Tổng: {len(connected_clients)})")
+            except (BlockingIOError, socket.error):
+                pass
+            except Exception:
+                break
+
+            # Thu gom tối đa 50 sự kiện trong queue để gửi theo batch
+            batch = []
+            while len(batch) < 50:
+                try:
+                    item = self.telemetry_queue.get_nowait()
+                    batch.append(item)
+                except queue.Empty:
+                    break
+
+            if batch and connected_clients:
+                payload = "".join(json.dumps(x) + "\n" for x in batch).encode("utf-8")
+                dead_clients = []
+                for cl in connected_clients:
+                    try:
+                        cl.sendall(payload)
+                    except Exception:
+                        dead_clients.append(cl)
+                for dc in dead_clients:
+                    try:
+                        dc.close()
+                    except Exception:
+                        pass
+                    if dc in connected_clients:
+                        connected_clients.remove(dc)
+            elif not batch:
+                time.sleep(0.02)
 
     # ==========================================================================
     # 4. TÍNH TOÁN ĐA ĐƯỜNG & LẬP TRÌNH ECMP GROUP TABLE (OFPGT_SELECT)

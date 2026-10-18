@@ -59,6 +59,20 @@ def main():
     args = parser.parse_args()
 
     output_dir = args.output_dir
+    # Nếu không chỉ định thư mục con (-o), tự động tìm thư mục snapshot mới nhất (YYYY-MM-DD_HH-MM)
+    # để lưu đồng bộ kết quả, tuyệt đối không xả file lẻ ra thư mục gốc results/
+    if output_dir == RESULTS_DIR:
+        subdirs = [
+            os.path.join(RESULTS_DIR, d) for d in os.listdir(RESULTS_DIR)
+            if os.path.isdir(os.path.join(RESULTS_DIR, d)) and not d.startswith('.')
+            and d not in ('Excel', 'digitization_verification')
+        ]
+        if subdirs:
+            subdirs.sort(key=os.path.getmtime, reverse=True)
+            output_dir = subdirs[0]
+        else:
+            from datetime import datetime
+            output_dir = os.path.join(RESULTS_DIR, datetime.now().strftime("%Y-%m-%d_%H-%M"))
     os.makedirs(output_dir, exist_ok=True)
     chart_output_path = os.path.join(output_dir, "chart_facebook_workload_validation.png")
     report_output_path = os.path.join(output_dir, "ks_test_results.txt")
@@ -75,9 +89,15 @@ def main():
         if os.path.exists(candidate):
             dataset_path = candidate
         else:
-            print(f"[!] Không tìm thấy file dataset thực nghiệm tại: {dataset_path}")
-            print("[!] Hãy chạy traffic_generator.py và analyze_and_label_dataset.py trước.")
-            sys.exit(1)
+            for d in os.listdir(RESULTS_DIR):
+                sub_csv = os.path.join(RESULTS_DIR, d, "traffic_flow_dataset_with_paths.csv")
+                if os.path.exists(sub_csv):
+                    dataset_path = sub_csv
+                    break
+            if not os.path.exists(dataset_path):
+                print(f"[!] Không tìm thấy file dataset thực nghiệm tại: {dataset_path}")
+                print("[!] Hãy chạy traffic_generator.py và analyze_and_label_dataset.py trước.")
+                sys.exit(1)
 
     df_exp = pd.read_csv(dataset_path)
     print(f"[*] Đã nạp {len(df_exp):,} mẫu luồng thực nghiệm từ: {dataset_path}")
