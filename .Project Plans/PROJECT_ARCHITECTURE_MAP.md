@@ -45,12 +45,21 @@ flowchart TD
         results_2026_10_17_22_22_link_utilization_telemetry_csv["📈 link_utilization_telemetry.csv"]
         results_2026_10_17_22_22_network_evaluation_kpis_csv["📈 network_evaluation_kpis.csv"]
         results_2026_10_17_22_22_traffic_flow_dataset_with_paths_csv["📈 traffic_flow_dataset_with_paths.csv"]
+        results_2026_10_18_13_36_link_utilization_telemetry_csv["📈 link_utilization_telemetry.csv"]
+        results_2026_10_18_13_36_network_evaluation_kpis_csv["📈 network_evaluation_kpis.csv"]
+        results_2026_10_18_13_36_traffic_flow_dataset_with_paths_csv["📈 traffic_flow_dataset_with_paths.csv"]
+        results_2026_10_18_19_30_link_utilization_telemetry_csv["📈 link_utilization_telemetry.csv"]
+        results_2026_10_18_19_30_network_evaluation_kpis_csv["📈 network_evaluation_kpis.csv"]
+        results_2026_10_18_19_30_traffic_flow_dataset_with_paths_csv["📈 traffic_flow_dataset_with_paths.csv"]
+        results_2026_10_18_21_03_link_utilization_telemetry_csv["📈 link_utilization_telemetry.csv"]
+        results_2026_10_18_21_03_network_evaluation_kpis_csv["📈 network_evaluation_kpis.csv"]
+        results_2026_10_18_21_03_traffic_flow_dataset_with_paths_csv["📈 traffic_flow_dataset_with_paths.csv"]
     end
 
+    controller_analyze_and_label_dataset -->|imports| controller_unified_sampler
     controller_management_plane -->|imports| controller_ebpf_loader
     controller_traffic_generator -->|imports| controller_unified_sampler
     controller_validate_workload_kstest -->|imports| controller_unified_sampler
-    controller_analyze_and_label_dataset -->|imports| controller_unified_sampler
     controller_topology_config_json -.->|ref: /ecn_settings/enabled| controller_traffic_config_json
     controller_topology_config_json -.->|ref: /ecn_settings/marking_threshold_k_bytes| controller_traffic_config_json
     controller_topology_config_json -.->|ref: /ecn_settings/limit_bytes| controller_traffic_config_json
@@ -58,6 +67,7 @@ flowchart TD
     controller_traffic_config_json -.->|ref: /system_info/hardware_reference/server_nic_speed_mbps| controller_topology_config_json
     controller_traffic_config_json -.->|ref: /hosts/resources/cpus| controller_topology_config_json
     controller_traffic_config_json -.->|ref: /system_info/hardware_reference/server_physical_cores| controller_topology_config_json
+    controller_traffic_config_json -.->|ref: /hosts/total_hosts| controller_topology_config_json
     controller_spine_leaf_topo <-->|OpenFlow 1.3 TCP:6653| controller_controller
     controller_controller <-->|Ryu REST API / Stats| controller_management_plane
     controller_ebpf_telemetry_c -->|Compiled & Loaded| controller_ebpf_loader

@@ -275,7 +275,18 @@ def build_docker_dcn():
         info(f"[*] Bước 5.2: Kích hoạt ECN trên Hosts (tcp_ecn=1) và cấu hình RED/ECN (K={k_bytes} B) quản trị từ traffic_config.json...\n")
         for h_name, h_obj in hosts.items():
             h_obj.cmd("sysctl -w net.ipv4.tcp_ecn=1")
+            for intf in h_obj.intfList():
+                if intf.name != "lo":
+                    h_obj.cmd(f"ethtool -K {intf.name} tso off gso off gro off tx off rx off 2>/dev/null || true")
         inet_host.cmd("sysctl -w net.ipv4.tcp_ecn=1")
+        for intf in inet_host.intfList():
+            if intf.name != "lo":
+                inet_host.cmd(f"ethtool -K {intf.name} tso off gso off gro off tx off rx off 2>/dev/null || true")
+
+        for sw in core_switches + agg_switches + access_switches:
+            for intf in sw.intfList():
+                if intf.name != "lo" and PROXY_PORT_NAME not in intf.name:
+                    sw.cmd(f"ethtool -K {intf.name} tso off gso off gro off 2>/dev/null || true")
 
         for sw in access_switches + agg_switches:
             for intf in sw.intfList():

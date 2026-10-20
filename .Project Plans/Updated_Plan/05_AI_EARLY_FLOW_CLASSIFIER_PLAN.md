@@ -42,19 +42,25 @@ Trong các hệ thống mạng điều khiển thời gian thực (SDN), độ t
 
 ---
 
-### 3.2. Không gian Vector Đặc trưng Đầu vào (Input Feature Space $\vec{x}$)
-Mô hình tiếp nhận vector đặc trưng 11 chiều trích xuất từ tầng Telemetry:
-$$\vec{x} = \left[ dur, \ sbytes, \ dbytes, \ Spkts, \ Dpkts, \ Sload, \ Dload, \ smeansz, \ dmeansz, \ Ratio, \ locality \right]^T \in \mathbb{R}^{11}$$
-- Các đặc trưng tỷ lệ tốc độ ($Sload, Dload$) phản ánh tốc độ bơm lưu lượng tức thời. Luồng Voi thường có $smeansz \to 1460\text{ Bytes}$ (Full MTU) và $Ratio \gg 1$.
-- Chuẩn hóa dữ liệu bằng `RobustScaler` để triệt tiêu ảnh hưởng của các giá trị ngoại lai (Outliers) trong phân phối đuôi dài Pareto.
+### 3.2. Không gian Vector Đặc trưng Đầu vào (Input Feature Space $\vec{x}$) & Khảo sát Feature Importance
+*(Xem chi tiết quy trình chuẩn hóa và đánh giá độ quan trọng đặc trưng tại [`09_DATA_NORMALIZATION_AND_FEATURE_ENGINEERING_PLAN.md`](file:///c:/Users/USER/Desktop/SDN%20KLTN/.Project%20Plans/Updated_Plan/09_DATA_NORMALIZATION_AND_FEATURE_ENGINEERING_PLAN.md))*
+
+Mô hình tiếp nhận bộ đặc trưng chia làm 3 nhóm rõ ràng:
+1. **Nhóm 1 (5 Đặc trưng Bắt buộc từ bộ đếm phần cứng OVS):** `dur`, `sbytes`, `dbytes`, `Spkts`, `Dpkts`.
+2. **Nhóm 2 (5 Đặc trưng Phái sinh cốt lõi tính tức thời $O(1)$):** `Sload`, `Dload`, `smeansz`, `dmeansz`, `Ratio` (`sbytes / dbytes`).
+3. **Nhóm 3 (4 Đặc trưng Mở rộng chi phí bằng 0):** `pkt_ratio` (`Spkts / Dpkts`), `byte_rate`, `pkt_rate`, `protocol`.
+- **Chiến lược Đánh giá Feature Importance 2 Kịch bản:**
+  * *Kịch bản A (Full Features - Có `sbytes`, `Spkts`):* Kiểm chứng tính nhất quán của nhãn Ground-Truth (`sbytes` chiếm `29.85%`, `Spkts` chiếm `21.88%`).
+  * *Kịch bản B (Early Rate & Packet Behavior - Loại bỏ `sbytes`, `Spkts` chống Target Leakage):* Khai phá sức mạnh của Nhóm 2 và Nhóm 3 khi phân loại sớm, trong đó `smeansz` vươn lên Hạng 1 (`31.00%`), `dbytes` Hạng 2 (`17.69%`), `Dpkts` Hạng 3 (`12.79%`), và `Ratio` Hạng 4 (`10.50%`).
+- Chuẩn hóa dữ liệu bằng biến đổi $\log_{10}$ cho tỷ số bất đối xứng (`Ratio_log`, `pkt_ratio_log`) kết hợp `RobustScaler` để triệt tiêu ảnh hưởng của các giá trị ngoại lai (Outliers) trong phân phối đuôi dài Pareto.
 
 ---
 
 ### 3.3. Định nghĩa Nhãn Ground-Truth Dựa trên Phân vị Pareto & Chuẩn Presto
 Theo hồ sơ phân phối thực nghiệm của bài báo Facebook SIGCOMM 2015 và kiến trúc Presto SIGCOMM 2015, ngưỡng phân tách luồng Voi/Chuột được xác lập tại $S_{\text{threshold}} = 65,536\text{ Bytes}$ ($64\text{ KB}$, ứng với phân vị $P_{83}$):
-$$y = \begin{cases} 1 \ (\text{Elephant Flow}), & \text{khi } sbytes + dbytes \ge 65,536\text{ Bytes} \ (64\text{ KB}) \\ 0 \ (\text{Mice Flow}), & \text{khi } sbytes + dbytes < 65,536\text{ Bytes} \end{cases}$$
+$$y = \begin{cases} 1 \ (\text{Elephant Flow}), & \text{khi } sbytes \ge 65,536\text{ Bytes} \ (64\text{ KB}) \\ 0 \ (\text{Mice Flow}), & \text{khi } sbytes < 65,536\text{ Bytes} \end{cases}$$
 - **Xử lý Mất cân bằng Mẫu (Class Imbalance):**
-  Trong mạng thực tế, số lượng luồng Chuột chiếm $81.06\%$, trong khi luồng Voi chiếm $18.94\%$. Đề tài áp dụng kỹ thuật cân bằng trọng số lớp (Class Weighting):
+  Trong tập thực nghiệm `results/2026-10-19_23-38/completed_flows_dataset.csv` (`4,772` luồng), số lượng luồng Chuột chiếm $82.71\%$ (`3,947` luồng), trong khi luồng Voi chiếm $17.29\%$ (`825` luồng). Đề tài áp dụng kỹ thuật cân bằng trọng số lớp (Class Weighting):
   $$w_{\text{Elephant}} = \frac{N_{\text{total}}}{2 \cdot N_{\text{Elephant}}}, \quad w_{\text{Mice}} = \frac{N_{\text{total}}}{2 \cdot N_{\text{Mice}}}$$
   kết hợp hàm mất mát Focal Loss / Weighted Cross-Entropy để phạt nặng các trường hợp bỏ sót luồng Voi.
 

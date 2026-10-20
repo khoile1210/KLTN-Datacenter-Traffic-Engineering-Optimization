@@ -25,12 +25,30 @@ if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
 if sys.stderr and hasattr(sys.stderr, 'reconfigure'):
     sys.stderr.reconfigure(encoding='utf-8')
 
+import argparse
+
+parser = argparse.ArgumentParser(description="SDN DCN Academic Results Visualizer")
+parser.add_argument("-o", "--output-dir", default=None, help="Thư mục lưu biểu đồ kết quả")
+cli_args, _ = parser.parse_known_args()
+
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RESULTS_DIR = os.path.join(BASE_DIR, "results")
 
-# Tạo thư mục theo timestamp ngày tháng giờ phút
-NOW_STR = datetime.now().strftime("%Y-%m-%d_%H-%M")
-TARGET_DIR = os.path.join(RESULTS_DIR, NOW_STR)
+if cli_args.output_dir:
+    TARGET_DIR = cli_args.output_dir
+else:
+    subdirs = [
+        os.path.join(RESULTS_DIR, d) for d in os.listdir(RESULTS_DIR)
+        if os.path.isdir(os.path.join(RESULTS_DIR, d)) and not d.startswith('.')
+        and d not in ('Excel', 'digitization_verification')
+    ]
+    if subdirs:
+        subdirs.sort(key=os.path.getmtime, reverse=True)
+        TARGET_DIR = subdirs[0]
+    else:
+        NOW_STR = datetime.now().strftime("%Y-%m-%d_%H-%M")
+        TARGET_DIR = os.path.join(RESULTS_DIR, NOW_STR)
+
 os.makedirs(TARGET_DIR, exist_ok=True)
 
 # Cấu hình Seaborn & Matplotlib
@@ -41,7 +59,10 @@ plt.rcParams['axes.linewidth'] = 0.8
 
 
 def resolve_csv_path(filename):
-    """Tìm file CSV trong RESULTS_DIR hoặc trong thư mục snapshot mới nhất (tránh lỗi khi file đã được gom vào thư mục con)."""
+    """Tìm file CSV trong TARGET_DIR, RESULTS_DIR hoặc trong thư mục snapshot mới nhất."""
+    target_path = os.path.join(TARGET_DIR, filename)
+    if os.path.exists(target_path):
+        return target_path
     direct_path = os.path.join(RESULTS_DIR, filename)
     if os.path.exists(direct_path):
         return direct_path
@@ -61,23 +82,56 @@ def resolve_csv_path(filename):
 
 
 def plot_traffic_flows():
-    csv_path = resolve_csv_path("traffic_flow_dataset_with_paths.csv")
+    # Ưu tiên completed_flows_dataset.csv, fallback sang traffic_flow_dataset_with_paths.csv
+    csv_path = resolve_csv_path("completed_flows_dataset.csv")
+    if not os.path.exists(csv_path):
+        csv_path = resolve_csv_path("traffic_flow_dataset_with_paths.csv")
     if not os.path.exists(csv_path):
         print(f"[!] Bỏ qua traffic flows vì không thấy: {csv_path}")
         return
-    
+
     print("[*] Đang vẽ 01_traffic_flows_characteristics.png...")
     df = pd.read_csv(csv_path)
-    
+    total_records = len(df)
+
+    # Thích ứng tự động: nếu có cờ is_completed thì lọc trực tiếp, ngược lại fallback group-by 5-tuple
+    if "is_completed" in df.columns and (df["is_completed"] == 1).any():
+        df_completed = df[df["is_completed"] == 1].copy()
+    else:
+        flow_key_cols = ['src_ip', 'dst_ip', 'src_port', 'dst_port', 'protocol']
+        if all(col in df.columns for col in flow_key_cols):
+            df_completed = df.sort_values(['sbytes', 'dur']).groupby(flow_key_cols, as_index=False).last()
+        else:
+            df_completed = df
+    num_completed = len(df_completed)
+
+    # Tìm tệp viễn trắc thô (traffic_flow_dataset_with_paths.csv) để vẽ đường nét đứt mờ đối sánh (nếu có)
+    trace_path = resolve_csv_path("traffic_flow_dataset_with_paths.csv")
+    if os.path.exists(trace_path) and os.path.abspath(trace_path) != os.path.abspath(csv_path):
+        try:
+            df_trace = pd.read_csv(trace_path)
+            sbytes_all = df_trace["sbytes"].dropna().values
+            total_records = len(df_trace)
+        except Exception:
+            sbytes_all = df["sbytes"].dropna().values
+    else:
+        sbytes_all = df["sbytes"].dropna().values
+
     fig, axes = plt.subplots(2, 2, figsize=(14, 11))
-    
-    # 1. ECDF Flow Size
+
+    # 1. ECDF Flow Size (Dual-View: Completed Flows vs All Telemetry Records)
     ax1 = axes[0, 0]
-    sbytes = df["sbytes"].dropna().values
-    sort_sbytes = np.sort(sbytes)
-    ecdf_sbytes = np.arange(1, len(sort_sbytes) + 1) / len(sort_sbytes)
-    ax1.plot(sort_sbytes, ecdf_sbytes, color="#1f77b4", linewidth=2.2, label=f"Tất cả luồng (N={len(sort_sbytes):,})")
-    
+    sbytes_comp = df_completed["sbytes"].dropna().values
+    sort_sbytes_comp = np.sort(sbytes_comp)
+    ecdf_comp = np.arange(1, len(sort_sbytes_comp) + 1) / len(sort_sbytes_comp)
+    ax1.plot(sort_sbytes_comp, ecdf_comp, color="#1f77b4", linewidth=2.4, label=f"Luồng hoàn tất (N={len(sort_sbytes_comp):,})")
+
+    if total_records > num_completed:
+        sort_sbytes_all = np.sort(sbytes_all)
+        ecdf_all = np.arange(1, len(sort_sbytes_all) + 1) / len(sort_sbytes_all)
+        ax1.plot(sort_sbytes_all, ecdf_all, color="#95a5a6", linestyle="-.", linewidth=1.5, alpha=0.6,
+                 label=f"Tất cả bản ghi viễn trắc (N={len(sort_sbytes_all):,})")
+
     # Kiểm tra cấu hình ngưỡng: Chỉ vẽ đường dóng khi người dùng đã chủ động chốt ngưỡng cụ thể
     cfg_path = os.path.join(os.path.dirname(__file__), "traffic_config.json")
     s_th = None
@@ -89,55 +143,60 @@ def plot_traffic_flows():
             pass
     if s_th and s_th > 0:
         ax1.axvline(x=s_th, color="#d62728", linestyle="--", linewidth=1.8, label=f"Ngưỡng Elephant ({s_th/1024:.1f} KB)")
-        
+
     ax1.set_xscale("log")
     ax1.set_title("Hàm phân phối tích lũy (ECDF) Kích thước luồng", fontsize=11, fontweight="bold")
     ax1.set_xlabel("Flow Size - sbytes (Bytes) [Thang Log]", fontsize=10)
     ax1.set_ylabel("F(x) - Tỷ lệ tích lũy", fontsize=10)
     ax1.legend(loc="lower right", frameon=True)
     ax1.grid(True, which="both", ls=":", alpha=0.6)
-    
-    # 2. Duration Distribution
+
+    # 2. Duration Distribution (Completed Flows True FCT)
     ax2 = axes[0, 1]
-    dur = df["dur"].dropna()
+    dur = df_completed["dur"].dropna()
     sns.histplot(dur, bins=40, kde=True, ax=ax2, color="#2ca02c", edgecolor="#1b661b")
-    ax2.set_title("Phân phối Thời lượng luồng (Duration / FCT)", fontsize=11, fontweight="bold")
-    ax2.set_xlabel("Duration (Giây)", fontsize=10)
+    med_dur = dur.median()
+    p90_dur = dur.quantile(0.9)
+    ax2.axvline(x=med_dur, color="#e67e22", linestyle="--", linewidth=1.8, label=f"Median P50 = {med_dur:.3f}s")
+    ax2.axvline(x=p90_dur, color="#9b59b6", linestyle=":", linewidth=1.8, label=f"P90 = {p90_dur:.3f}s")
+    ax2.set_title(f"Phân phối Thời lượng luồng hoàn tất (True FCT, N={num_completed:,})", fontsize=11, fontweight="bold")
+    ax2.set_xlabel("Duration / FCT (Giây)", fontsize=10)
     ax2.set_ylabel("Số lượng luồng", fontsize=10)
+    ax2.legend(loc="upper right", frameon=True)
     ax2.grid(True, ls=":", alpha=0.6)
-    
-    # 3. Locality Breakdown (Tự thích ứng 4 cấp theo Bảng 3 bài báo Facebook hoặc 3 cấp phẳng)
+
+    # 3. Locality Breakdown (30k Luồng Hoàn tất)
     ax3 = axes[1, 0]
-    locality_counts = df["locality"].value_counts()
+    locality_counts = df_completed["locality"].value_counts()
     colors = ["#2ecc71", "#3498db", "#e67e22", "#9b59b6", "#e74c3c"]
     wedges, texts, autotexts = ax3.pie(
-        locality_counts.values, 
-        labels=locality_counts.index, 
+        locality_counts.values,
+        labels=locality_counts.index,
         autopct="%1.2f%%",
-        startangle=140, 
+        startangle=140,
         colors=colors[:len(locality_counts)],
         explode=[0.04] * len(locality_counts),
         textprops=dict(fontweight="bold")
     )
     for at in autotexts:
         at.set_color("white")
-    ax3.set_title("Phân bố Không gian Luồng (Traffic Locality)", fontsize=11, fontweight="bold")
-    
-    # 4. Hop Count Distribution
+    ax3.set_title(f"Phân bố Không gian Luồng (N={num_completed:,} Luồng Hoàn tất)", fontsize=11, fontweight="bold")
+
+    # 4. Hop Count Distribution (30k Luồng Hoàn tất)
     ax4 = axes[1, 1]
-    hop_counts = df["hop_count"].value_counts().sort_index()
+    hop_counts = df_completed["hop_count"].value_counts().sort_index()
     x_labels = [f"{int(h)} Hop" if h == 1 else f"{int(h)} Hops" for h in hop_counts.index]
     bar_colors = sns.color_palette("Blues_r", len(hop_counts))
     bars = ax4.bar(x_labels, hop_counts.values, color=bar_colors, width=0.45, edgecolor="#333")
     for bar in bars:
         h = bar.get_height()
-        ax4.text(bar.get_x() + bar.get_width()/2., h + len(df)*0.01, f"{h:,}\n({h/len(df)*100:.1f}%)", 
+        ax4.text(bar.get_x() + bar.get_width()/2., h + len(df_completed)*0.01, f"{h:,}\n({h/len(df_completed)*100:.1f}%)",
                  ha="center", va="bottom", fontsize=10, fontweight="bold")
     ax4.set_ylim(0, max(hop_counts.values) * 1.15 if len(hop_counts) > 0 else 10)
-    ax4.set_title("Phân phối Số chặng Switch (Hop Count)", fontsize=11, fontweight="bold")
+    ax4.set_title(f"Phân phối Số chặng Switch (N={num_completed:,} Luồng Hoàn tất)", fontsize=11, fontweight="bold")
     ax4.set_ylabel("Số lượng luồng", fontsize=10)
     ax4.grid(True, axis="y", ls=":", alpha=0.6)
-    
+
     plt.suptitle("ĐẶC TRƯNG LƯU LƯỢNG MẠNG (TRAFFIC FLOWS CHARACTERISTICS)", fontsize=14, fontweight="bold", y=0.99)
     plt.tight_layout()
     out_file = os.path.join(TARGET_DIR, "01_traffic_flows_characteristics.png")

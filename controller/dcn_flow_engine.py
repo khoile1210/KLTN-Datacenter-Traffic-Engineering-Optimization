@@ -149,10 +149,16 @@ def run_client_udp(dst_ip, dst_port, total_bytes, bind_ip=None):
         s.settimeout(5.0)
         rem = total_bytes
         chunk = b"U" * min(1400, rem)
+        first_packet = True
         while rem > 0:
             send_size = min(len(chunk), rem)
             s.sendto(chunk[:send_size], (dst_ip, int(dst_port)))
             rem -= send_size
+            if first_packet and rem > 0:
+                first_packet = False
+                # Nhịp nghỉ vi mô 2ms sau gói UDP đầu tiên để Ryu kịp cài FlowMod Priority 150
+                # xuống OVS Ingress Switch trước khi các gói UDP tiếp theo đi tới
+                time.sleep(0.002)
     except Exception:
         pass
     finally:

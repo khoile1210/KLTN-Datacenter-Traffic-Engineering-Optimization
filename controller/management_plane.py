@@ -61,8 +61,9 @@ if not os.path.exists(RESULTS_DIR):
     RESULTS_DIR = os.path.join(os.path.dirname(__file__), "results")
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
-# 1. Các tệp tin kết quả xuất ra (4 luồng chuyên biệt)
+# 1. Các tệp tin kết quả xuất ra (Phân tách Luồng Hoàn tất và Dữ liệu Viễn trắc)
 OUTPUT_FLOW_CSV = os.path.join(RESULTS_DIR, "traffic_flow_dataset_with_paths.csv")
+OUTPUT_COMPLETED_FLOW_CSV = os.path.join(RESULTS_DIR, "completed_flows_dataset.csv")
 OUTPUT_DEVICE_CSV = os.path.join(RESULTS_DIR, "device_resource_utilization.csv")
 OUTPUT_HEALTH_CSV = os.path.join(RESULTS_DIR, "system_and_network_health.csv")
 OUTPUT_LINK_CSV = os.path.join(RESULTS_DIR, "link_utilization_telemetry.csv")
@@ -72,15 +73,16 @@ OUTPUT_QUEUE_CSV = os.path.join(RESULTS_DIR, "queue_occupancy_ecn.csv")
 POLL_INTERVAL_SEC = 0.5
 
 # ==============================================================================
-# ĐỊNH NGHĨA CẤU TRÚC TIÊU ĐỀ CSV CHO 4 BỘ METRICS
+# ĐỊNH NGHĨA CẤU TRÚC TIÊU ĐỀ CSV CHO CÁC BỘ METRICS
 # ==============================================================================
-# Bộ 1: Dataset luồng cho AI (10 Features + Hop-by-Hop + Metadata)
+# Bộ 1: Dataset luồng cho AI (10 Features + Hop-by-Hop + Metadata + Provenance)
 FLOW_CSV_HEADERS = [
     "timestamp", "src_ip", "dst_ip", "src_port", "dst_port", "protocol",
     "dur", "sbytes", "dbytes", "Spkts", "Dpkts",
     "Sload", "Dload", "smeansz", "dmeansz", "Ratio",
     "hop_count", "path", "label",
-    "src_host", "dst_host", "locality", "pkt_rate", "byte_rate"
+    "src_host", "dst_host", "locality", "pkt_rate", "byte_rate",
+    "timestamp_epoch_ms", "record_source", "duration_source", "is_completed"
 ]
 
 # Bộ 2: Giám sát tài nguyên thiết bị (Switch & Host Containers)
@@ -364,6 +366,31 @@ class BiFlowStitcher:
                     Dpkts = e1["pkts"]
 
                 dur = max(e1.get("dur", 0.0), e2.get("dur", 0.0))
+
+                def _extract_ms(evt):
+                    if not evt:
+                        return int(now_ts * 1000)
+                    if evt.get("timestamp_epoch_ms"):
+                        return int(evt["timestamp_epoch_ms"])
+                    if evt.get("timestamp"):
+                        return int(float(evt["timestamp"]) * 1000)
+                    return int(now_ts * 1000)
+
+                e1_ms = _extract_ms(e1)
+                e2_ms = _extract_ms(e2)
+                latest_e = e1 if e1_ms >= e2_ms else e2
+                timestamp_epoch_ms = max(e1_ms, e2_ms)
+                timestamp_str = (
+                    latest_e.get("timestamp_str")
+                    or e2.get("timestamp_str")
+                    or e1.get("timestamp_str")
+                    or datetime.fromtimestamp(timestamp_epoch_ms / 1000.0).strftime("%Y-%m-%d %H:%M:%S.%f")
+                )
+
+                if sbytes == 0 and dbytes == 0:
+                    return
+
+                rec_source = "flow_removed_push_unilateral" if dbytes == 0 else "flow_removed_push"
                 self.committed.append({
                     "src_ip": fwd_ip,
                     "dst_ip": bwd_ip,
@@ -374,7 +401,12 @@ class BiFlowStitcher:
                     "sbytes": sbytes,
                     "dbytes": dbytes,
                     "Spkts": Spkts,
-                    "Dpkts": Dpkts
+                    "Dpkts": Dpkts,
+                    "record_source": rec_source,
+                    "duration_source": "hardware_flow_removed",
+                    "is_completed": 1,
+                    "timestamp_epoch_ms": timestamp_epoch_ms,
+                    "timestamp_str": timestamp_str
                 })
             else:
                 self.pending[c_key] = (event, now_ts)
@@ -389,7 +421,11 @@ class BiFlowStitcher:
                     expired_keys.append(k)
 
             for k in expired_keys:
-                e, _ = self.pending.pop(k)
+                item = self.pending.pop(k, None)
+                if not item:
+                    continue
+                e, _ = item
+                e_ms = int(e.get("timestamp_epoch_ms") or (float(e["timestamp"]) * 1000 if e.get("timestamp") else now_ts * 1000))
                 self.committed.append({
                     "src_ip": e["src_ip"],
                     "dst_ip": e["dst_ip"],
@@ -400,7 +436,12 @@ class BiFlowStitcher:
                     "sbytes": e.get("bytes", 0),
                     "dbytes": 0,
                     "Spkts": e.get("pkts", 1),
-                    "Dpkts": 0
+                    "Dpkts": 0,
+                    "record_source": "flow_removed_push_unilateral",
+                    "duration_source": "hardware_flow_removed",
+                    "is_completed": 1,
+                    "timestamp_epoch_ms": e_ms,
+                    "timestamp_str": e.get("timestamp_str") or datetime.fromtimestamp(e_ms / 1000.0).strftime("%Y-%m-%d %H:%M:%S.%f")
                 })
 
     def drain_committed(self):
@@ -477,6 +518,7 @@ class ComprehensiveManagementPlane:
     def __init__(self, rest_url=RYU_REST_URL):
         self.rest_url = rest_url
         self.flow_csv = OUTPUT_FLOW_CSV
+        self.completed_flow_csv = OUTPUT_COMPLETED_FLOW_CSV
         self.device_csv = OUTPUT_DEVICE_CSV
         self.health_csv = OUTPUT_HEALTH_CSV
         self.link_csv = OUTPUT_LINK_CSV
@@ -618,9 +660,10 @@ class ComprehensiveManagementPlane:
         self.host_port_map[self.inet_ip] = 1
 
     def _init_csv_files(self):
-        """Khởi tạo toàn bộ 6 tệp tin CSV với header chuẩn nếu chưa tồn tại."""
+        """Khởi tạo toàn bộ các tệp tin CSV với header chuẩn nếu chưa tồn tại."""
         files_headers = [
-            (self.flow_csv, FLOW_CSV_HEADERS, "Dataset luồng (10 Features + Hop-by-Hop)"),
+            (self.flow_csv, FLOW_CSV_HEADERS, "Dataset luồng thô & viễn trắc (Raw Telemetry Trace)"),
+            (self.completed_flow_csv, FLOW_CSV_HEADERS, "Dataset luồng hoàn tất (Completed Flows SSoT)"),
             (self.device_csv, DEVICE_CSV_HEADERS, "Giám sát tài nguyên thiết bị (CPU/RAM/Net IO)"),
             (self.health_csv, HEALTH_CSV_HEADERS, "Sức khỏe hệ thống và switch OVS"),
             (self.link_csv, LINK_CSV_HEADERS, "Giám sát & Đánh giá băng thông liên kết (Link Telemetry)"),
@@ -1017,14 +1060,17 @@ class ComprehensiveManagementPlane:
 
             if ebpf_fct is not None and ebpf_fct > 0:
                 true_dur = round(ebpf_fct, 4)
+                dur_source = "ebpf_hardware"
             elif tracker["last_active"] > tracker["first_seen"]:
                 true_dur = round(tracker["last_active"] - tracker["first_seen"], 4)
+                dur_source = "polling_elapsed"
             else:
                 # Luồng Mice hoàn tất trong 1 chu kỳ polling:
-                # Thời gian truyền vật lý trên đường link Access (20 Mbps) + RTT
+                # Thời gian truyền vật lý trên đường link Access + RTT
                 c_mbps = self.bw_access_host
                 phy_time = (tot_bytes * 8.0) / (c_mbps * 1e6) + 0.002
                 true_dur = max(round(phy_time, 4), 0.001)
+                dur_source = "physical_estimate"
 
             # 3. SINGLE COMMIT: Chỉ xuất bản ghi luồng 1 lần duy nhất khi hoàn tất
             # Không ghi lặp lại khi số bytes đứng im suốt 30 giây idle_timeout của OVS!
@@ -1040,7 +1086,11 @@ class ComprehensiveManagementPlane:
                     "sbytes": sbytes,
                     "dbytes": dbytes,
                     "Spkts": Spkts,
-                    "Dpkts": Dpkts
+                    "Dpkts": Dpkts,
+                    "record_source": "polling_snapshot",
+                    "duration_source": dur_source,
+                    "is_completed": 0,
+                    "timestamp_epoch_ms": int(now_ts * 1000)
                 })
 
         # Dọn dẹp các luồng đã bị OVS xóa sau khi hết timeout
@@ -1492,6 +1542,17 @@ class ComprehensiveManagementPlane:
             if sbytes == 0 and dbytes == 0:
                 continue
 
+            # Chuẩn hóa số gói tin theo giới hạn khung Ethernet vật lý (1514 Bytes)
+            # Khắc phục triệt để hiện tượng TSO/GSO gộp siêu khung khiến smeansz > 1518B
+            if sbytes > 0:
+                Spkts = max(int(Spkts), int(np.ceil(sbytes / 1514.0)))
+            else:
+                Spkts = 0
+            if dbytes > 0:
+                Dpkts = max(int(Dpkts), int(np.ceil(dbytes / 1514.0)))
+            else:
+                Dpkts = 0
+
             # Tính toán 10 đặc trưng
             Sload = sbytes / max(dur, eps)
             Dload = dbytes / max(dur, eps)
@@ -1531,7 +1592,7 @@ class ComprehensiveManagementPlane:
                 is_elephant = 1 if sbytes >= self.s_threshold_bytes else 0
 
             flow_records.append({
-                "timestamp": now_str,
+                "timestamp": f.get("timestamp_str") or now_str,
                 "src_ip": src_ip,
                 "dst_ip": dst_ip,
                 "src_port": src_port,
@@ -1554,7 +1615,11 @@ class ComprehensiveManagementPlane:
                 "dst_host": dst_name,
                 "locality": locality,
                 "pkt_rate": round(pkt_rate, 2),
-                "byte_rate": round(byte_rate, 2)
+                "byte_rate": round(byte_rate, 2),
+                "timestamp_epoch_ms": f.get("timestamp_epoch_ms", int(time.time() * 1000)),
+                "record_source": f.get("record_source", "polling_snapshot"),
+                "duration_source": f.get("duration_source", "polling_elapsed"),
+                "is_completed": f.get("is_completed", 0)
             })
 
         return flow_records
@@ -1660,7 +1725,7 @@ class ComprehensiveManagementPlane:
         cur_time = time.time()
         dt = max(cur_time - self.last_time, 0.001)
         self.last_time = cur_time
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
 
         # Reset bộ nhớ đệm Group Table cho chu kỳ mới (chống bão HTTP khi dò vết luồng)
         self._cycle_group_desc = {}
@@ -1700,7 +1765,13 @@ class ComprehensiveManagementPlane:
         # 5. Ghép cặp Bi-flow & Lần vết đường đi Hop-by-Hop (10 Features cho AI Classifier)
         flow_records = self.collect_flow_dataset(active_dpids, switch_flows_map, now_str)
         if flow_records:
-            pd.DataFrame(flow_records).to_csv(self.flow_csv, mode="a", header=False, index=False)
+            df_flow = pd.DataFrame(flow_records)
+            df_flow.to_csv(self.flow_csv, mode="a", header=False, index=False)
+
+            # Ghi nhận các luồng hoàn tất vào completed_flows_dataset.csv (chỉ khi có luồng hoàn tất thực sự)
+            completed_records = [r for r in flow_records if r.get("is_completed", 0) == 1]
+            if completed_records:
+                pd.DataFrame(completed_records).to_csv(self.completed_flow_csv, mode="a", header=False, index=False)
 
         # 6. Tính toán và lưu trữ các chỉ số KPI Đánh giá Toàn mạng (Evaluation Benchmarks)
         kpi_record = self.compute_and_save_kpis(flow_records, link_records, health_records, now_str)
@@ -1718,6 +1789,7 @@ def main():
     print(f"    - Cổng Ryu REST API : {RYU_REST_URL}")
     print(f"    - Chu kỳ Polling    : {POLL_INTERVAL_SEC} giây")
     print(f"    - 1. Dataset AI     : {collector.flow_csv} (10 Features + Hop-by-Hop + Locality)")
+    print(f"    - 1b. Luồng Hoàn tất: {collector.completed_flow_csv} (Completed Flows SSoT)")
     print(f"    - 2. Giám sát Node  : {collector.device_csv} (CPU %, RAM MB, Net IO)")
     print(f"    - 3. Giám sát Link  : {collector.link_csv} (Throughput Mbps, Utilization %, Drops)")
     print(f"    - 4. Benchmark KPIs : {collector.kpi_csv} (Total Throughput, Jain's Fairness, Loss %)")

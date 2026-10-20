@@ -14,6 +14,7 @@ Chạy    : ryu-manager --observe-links controller.py ryu.app.ofctl_rest ryu.app
 import os
 import json
 import time
+from datetime import datetime
 import socket
 import threading
 import queue
@@ -96,7 +97,8 @@ class MultiTierEcmpController(app_manager.RyuApp):
 
         self.group_id_map = {ip: idx + 1 for idx, ip in enumerate(self.host_db.keys())}
         self.installed_groups = set()     # Lưu tập hợp (dpid, group_id)
-        self.installed_biflows = {}       # Lưu ánh xạ biflow_signature -> timestamp cài đặt (TTL 35s)
+        self.installed_biflows = {}       # Lưu ánh xạ biflow_signature -> timestamp cài đặt (TTL 1.5s)
+        self.packet_in_accounting = {}    # Bù byte/gói đầu tiên đi qua PacketOut: (dpid, s_ip, d_ip, s_pt, d_pt, proto) -> [bytes, pkts, ts]
 
         # Quản lý Debounce Timer chống bão FlowMod khi LLDP phát hiện link dồn dập
         self.topology_debounce_timer = None
@@ -333,12 +335,12 @@ class MultiTierEcmpController(app_manager.RyuApp):
                 dst_port = udp_pkt.dst_port
 
             if src_port > 0 and dst_port > 0:
-                # FAST IN-MEMORY DEDUP WITH TTL: Đảm bảo luật 5-tuple Priority 150 được cài trước khi đẩy PacketOut
+                # FAST IN-MEMORY DEDUP WITH TTL (1.5s): Đảm bảo luật 5-tuple Priority 150 được cài trước khi đẩy PacketOut
                 biflow_signature = tuple(sorted([(src_ip, src_port), (dst_ip, dst_port)])) + (proto,)
                 now_ts = time.time()
                 if (
                     biflow_signature not in self.installed_biflows
-                    or (now_ts - self.installed_biflows[biflow_signature]) >= 25.0
+                    or (now_ts - self.installed_biflows[biflow_signature]) >= 1.5
                 ):
                     self.installed_biflows[biflow_signature] = now_ts
 
@@ -362,6 +364,23 @@ class MultiTierEcmpController(app_manager.RyuApp):
                         return
                 else:
                     return
+
+                # Ghi nhận dung lượng gói tin đi qua PacketOut để bù chính xác vào FlowRemoved trên Ingress Switch
+                if src_port > 0 and dst_port > 0 and msg.data:
+                    if len(self.packet_in_accounting) > 5000:
+                        cutoff_ts = time.time() - 60.0
+                        self.packet_in_accounting = {
+                            k: v for k, v in self.packet_in_accounting.items() if v[2] >= cutoff_ts
+                        }
+                    acct_key = (dpid, src_ip, dst_ip, src_port, dst_port, proto)
+                    prev = self.packet_in_accounting.get(acct_key)
+                    pkt_len = len(msg.data)
+                    if prev:
+                        prev[0] += pkt_len
+                        prev[1] += 1
+                        prev[2] = time.time()
+                    else:
+                        self.packet_in_accounting[acct_key] = [pkt_len, 1, time.time()]
 
                 actions = [datapath.ofproto_parser.OFPActionOutput(out_port)]
                 out = datapath.ofproto_parser.OFPPacketOut(
@@ -465,6 +484,19 @@ class MultiTierEcmpController(app_manager.RyuApp):
         else:
             true_dur = max(dur_raw, 0.001)
 
+        # Giải phóng cache installed_biflows ngay khi luồng kết thúc và bù byte gói đầu tiên đi qua PacketOut
+        if s_pt > 0 and d_pt > 0:
+            biflow_sig = tuple(sorted([(s_ip, s_pt), (d_ip, d_pt)])) + (proto,)
+            self.installed_biflows.pop(biflow_sig, None)
+
+        acct_key = (dpid, s_ip, d_ip, s_pt, d_pt, proto)
+        pi_bytes, pi_pkts, _ = self.packet_in_accounting.pop(acct_key, (0, 0, 0.0))
+        total_bytes = int(msg.byte_count) + int(pi_bytes)
+        total_pkts = int(msg.packet_count) + int(pi_pkts)
+
+        now_ts = time.time()
+        now_str_us = datetime.fromtimestamp(now_ts).strftime("%Y-%m-%d %H:%M:%S.%f")
+
         event_rec = {
             "type": "FLOW_REMOVED",
             "dpid": dpid,
@@ -473,11 +505,13 @@ class MultiTierEcmpController(app_manager.RyuApp):
             "src_port": s_pt,
             "dst_port": d_pt,
             "proto": proto,
-            "bytes": int(msg.byte_count),
-            "pkts": int(msg.packet_count),
+            "bytes": total_bytes,
+            "pkts": total_pkts,
             "dur": round(true_dur, 6),
             "reason": int(msg.reason),
-            "timestamp": time.time()
+            "timestamp": now_ts,
+            "timestamp_str": now_str_us,
+            "timestamp_epoch_ms": int(now_ts * 1000)
         }
 
         try:
@@ -516,21 +550,28 @@ class MultiTierEcmpController(app_manager.RyuApp):
             except Exception:
                 break
 
-            # Thu gom tối đa 50 sự kiện trong queue để gửi theo batch
+            # Chỉ rút sự kiện khỏi queue khi ĐÃ CÓ client kết nối để tuyệt đối không làm rớt batch khi khởi động
+            if not connected_clients:
+                time.sleep(0.02)
+                continue
+
+            # Thu gom tối đa 100 sự kiện trong queue để gửi theo batch
             batch = []
-            while len(batch) < 50:
+            while len(batch) < 100:
                 try:
                     item = self.telemetry_queue.get_nowait()
                     batch.append(item)
                 except queue.Empty:
                     break
 
-            if batch and connected_clients:
+            if batch:
                 payload = "".join(json.dumps(x) + "\n" for x in batch).encode("utf-8")
                 dead_clients = []
+                sent_ok = False
                 for cl in connected_clients:
                     try:
                         cl.sendall(payload)
+                        sent_ok = True
                     except Exception:
                         dead_clients.append(cl)
                 for dc in dead_clients:
@@ -540,7 +581,14 @@ class MultiTierEcmpController(app_manager.RyuApp):
                         pass
                     if dc in connected_clients:
                         connected_clients.remove(dc)
-            elif not batch:
+                if not sent_ok:
+                    # Tất cả client đều đứt kết nối: Đẩy trả lại queue để bảo toàn 100% sự kiện
+                    for item in batch:
+                        try:
+                            self.telemetry_queue.put_nowait(item)
+                        except Exception:
+                            break
+            else:
                 time.sleep(0.02)
 
     # ==========================================================================
