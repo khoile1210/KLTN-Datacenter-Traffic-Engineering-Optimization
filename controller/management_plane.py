@@ -333,6 +333,35 @@ class BiFlowStitcher:
         return (min(end_a, end_b), max(end_a, end_b), proto)
 
     def add_event(self, event):
+        now_ts = time.time()
+        # 1. Xử lý tức thì bản ghi chụp sớm ở mốc < 10ms (EARLY_FLOW_STATS đã ghép 2 chiều tại Controller)
+        if event.get("type") == "EARLY_FLOW_STATS":
+            sbytes = int(event.get("sbytes", 0))
+            dbytes = int(event.get("dbytes", 0))
+            if sbytes == 0 and dbytes == 0:
+                return
+            e_ms = int(event.get("timestamp_epoch_ms") or (float(event["timestamp"]) * 1000 if event.get("timestamp") else now_ts * 1000))
+            t_str = event.get("timestamp_str") or datetime.fromtimestamp(e_ms / 1000.0).strftime("%Y-%m-%d %H:%M:%S.%f")
+            with self.lock:
+                self.committed.append({
+                    "src_ip": event["src_ip"],
+                    "dst_ip": event["dst_ip"],
+                    "src_port": int(event.get("src_port", 0)),
+                    "dst_port": int(event.get("dst_port", 0)),
+                    "protocol": int(event.get("proto", 0)),
+                    "dur": max(float(event.get("dur", 0.008)), 0.001),
+                    "sbytes": sbytes,
+                    "dbytes": dbytes,
+                    "Spkts": max(int(event.get("Spkts", 1)), 1 if sbytes > 0 else 0),
+                    "Dpkts": int(event.get("Dpkts", 0)),
+                    "record_source": "early_probe_sub10ms",
+                    "duration_source": "hardware_early_probe",
+                    "is_completed": 0,
+                    "timestamp_epoch_ms": e_ms,
+                    "timestamp_str": t_str
+                })
+            return
+
         s_ip = event.get("src_ip")
         d_ip = event.get("dst_ip")
         s_pt = event.get("src_port", 0)
@@ -342,7 +371,6 @@ class BiFlowStitcher:
             return
 
         c_key = self.make_canonical_key(s_ip, s_pt, d_ip, d_pt, proto)
-        now_ts = time.time()
 
         with self.lock:
             if c_key in self.pending:
@@ -882,17 +910,20 @@ class ComprehensiveManagementPlane:
             out_port = None
             flows = switch_flows_map.get(current_dpid, [])
 
-            # 1. Tìm action cổng ra trên switch hiện tại
+            # 1. Tìm action cổng ra trên switch hiện tại (Hỗ trợ cả top-level actions của Ryu ofctl_rest và instructions)
             for f in flows:
                 match = f.get("match", {})
                 if match.get("ipv4_dst") == dst_ip or match.get("nw_dst") == dst_ip:
+                    raw_actions = list(f.get("actions", []))
                     for inst in f.get("instructions", []):
-                        for act in inst.get("actions", []):
-                            a_type, a_val = parse_action_helper(act)
-                            if a_type == "GROUP":
-                                out_port = self.determine_active_out_port(current_dpid, a_val)
-                            elif a_type == "OUTPUT":
-                                out_port = a_val
+                        if isinstance(inst, dict):
+                            raw_actions.extend(inst.get("actions", []))
+                    for act in raw_actions:
+                        a_type, a_val = parse_action_helper(act)
+                        if a_type == "GROUP":
+                            out_port = self.determine_active_out_port(current_dpid, a_val)
+                        elif a_type == "OUTPUT":
+                            out_port = a_val
                     if out_port:
                         break
 
@@ -1028,27 +1059,34 @@ class ComprehensiveManagementPlane:
                 tot_bytes = 64
                 tot_pkts = 1
 
-            # 1. Flow State Machine: Theo dõi vòng đời luồng và chống nhân bản luồng lặp
+            # 1. Flow State Machine: Theo dõi vòng đời luồng và triệt tiêu 100% dòng "Zombie Idle-Wait"
+            # Khoảnh khắc đầu đời (< 10ms) đã được chụp chính xác bởi EARLY_FLOW_STATS từ Controller.
+            # Tại Poller 500ms, CHỈ ghi nhận bản ghi in-flight khi luồng đang thực sự tăng trưởng dữ liệu (tot_bytes > tracker["bytes"]).
             tracker = self.flow_tracker.get(pair_id)
+            is_actively_growing = False
             if not tracker:
-                # Luồng mới xuất hiện lần đầu trong OVS
+                # Luồng mới nhìn thấy lần đầu ở Poller 500ms: khởi tạo tracker để theo dõi độ tăng trưởng ở chu kỳ sau
                 tracker = {
                     "first_seen": now_ts,
                     "last_active": now_ts,
                     "bytes": tot_bytes,
                     "pkts": tot_pkts,
-                    "committed": False
+                    "committed": True
                 }
                 self.flow_tracker[pair_id] = tracker
             else:
-                # Luồng đã có trong cache: nếu bytes tăng thì cập nhật last_active
+                # Luồng đã có trong cache: chỉ khi bytes thực sự tăng mới xác nhận luồng còn đang truyền (không phải đang chờ 2.0s idle_timeout)
                 if tot_bytes > tracker["bytes"]:
                     tracker["last_active"] = now_ts
                     tracker["bytes"] = tot_bytes
                     tracker["pkts"] = tot_pkts
                     tracker["committed"] = False
+                    is_actively_growing = True
 
-            # 2. Tính toán True FCT (Flow Completion Time) chuẩn xác
+            if not is_actively_growing or tracker["committed"]:
+                continue
+
+            # 2. Tính thời gian hoạt động thực tế 100% (Tuyệt đối không dùng công thức nội suy physical_estimate từ sbytes)
             ebpf_fct = None
             if self.ebpf_manager and self.ebpf_manager.is_active:
                 f_metrics = self.ebpf_manager.get_flow_metrics()
@@ -1058,40 +1096,35 @@ class ComprehensiveManagementPlane:
                             ebpf_fct = m_val["fct_us"] / 1e6
                             break
 
+            ovs_active_dur = max(float(fwd_info.get("dur_ovs", 0.0)), float(bwd_info.get("dur_ovs", 0.0)))
+            elapsed_wall = max(now_ts - tracker["first_seen"], 0.001)
             if ebpf_fct is not None and ebpf_fct > 0:
                 true_dur = round(ebpf_fct, 4)
                 dur_source = "ebpf_hardware"
-            elif tracker["last_active"] > tracker["first_seen"]:
-                true_dur = round(tracker["last_active"] - tracker["first_seen"], 4)
-                dur_source = "polling_elapsed"
+            elif ovs_active_dur > 0:
+                true_dur = round(max(min(ovs_active_dur, elapsed_wall + 0.5), 0.001), 4)
+                dur_source = "ovs_active_duration"
             else:
-                # Luồng Mice hoàn tất trong 1 chu kỳ polling:
-                # Thời gian truyền vật lý trên đường link Access + RTT
-                c_mbps = self.bw_access_host
-                phy_time = (tot_bytes * 8.0) / (c_mbps * 1e6) + 0.002
-                true_dur = max(round(phy_time, 4), 0.001)
-                dur_source = "physical_estimate"
+                true_dur = round(elapsed_wall, 4)
+                dur_source = "polling_elapsed"
 
-            # 3. SINGLE COMMIT: Chỉ xuất bản ghi luồng 1 lần duy nhất khi hoàn tất
-            # Không ghi lặp lại khi số bytes đứng im suốt 30 giây idle_timeout của OVS!
-            if not tracker["committed"]:
-                tracker["committed"] = True
-                paired_records.append({
-                    "src_ip": src_ip,
-                    "dst_ip": dst_ip,
-                    "src_port": src_port,
-                    "dst_port": dst_port,
-                    "protocol": proto,
-                    "dur": true_dur,
-                    "sbytes": sbytes,
-                    "dbytes": dbytes,
-                    "Spkts": Spkts,
-                    "Dpkts": Dpkts,
-                    "record_source": "polling_snapshot",
-                    "duration_source": dur_source,
-                    "is_completed": 0,
-                    "timestamp_epoch_ms": int(now_ts * 1000)
-                })
+            tracker["committed"] = True
+            paired_records.append({
+                "src_ip": src_ip,
+                "dst_ip": dst_ip,
+                "src_port": src_port,
+                "dst_port": dst_port,
+                "protocol": proto,
+                "dur": true_dur,
+                "sbytes": sbytes,
+                "dbytes": dbytes,
+                "Spkts": Spkts,
+                "Dpkts": Dpkts,
+                "record_source": "polling_snapshot",
+                "duration_source": dur_source,
+                "is_completed": 0,
+                "timestamp_epoch_ms": int(now_ts * 1000)
+            })
 
         # Dọn dẹp các luồng đã bị OVS xóa sau khi hết timeout
         stale_keys = [k for k in self.flow_tracker.keys() if k not in active_pairs]
@@ -1584,12 +1617,9 @@ class ComprehensiveManagementPlane:
             else:
                 locality = "Extra-Rack"
 
-            # Gán nhãn Ground Truth chuẩn Presto / SIGCOMM 2015 (1: Elephant, 0: Mice, -1: Unlabeled khi threshold là null)
-            if self.s_threshold_bytes is None or self.s_threshold_bytes <= 0:
-                is_elephant = -1  # Unlabeled (Chưa gán nhãn, bảo toàn tính khách quan)
-            else:
-                # Sử dụng DUY NHẤT 1 ngưỡng toàn mạng: S_threshold_bytes từ traffic_config.json (64 KB)
-                is_elephant = 1 if sbytes >= self.s_threshold_bytes else 0
+            # Bảo toàn dữ liệu thô thuần khiết (Raw Unlabeled Telemetry):
+            # Không tự động gán nhãn 0/1 trong quá trình thu thập thô; việc gán nhãn được thực hiện ở bước Hậu kỳ.
+            is_elephant = -1
 
             flow_records.append({
                 "timestamp": f.get("timestamp_str") or now_str,
@@ -1638,9 +1668,9 @@ class ComprehensiveManagementPlane:
             active_mice = 0
             mice_durs = [f["dur"] for f in flow_records]
         else:
-            active_elephant = sum(1 for f in flow_records if f["label"] == 1)
-            active_mice = sum(1 for f in flow_records if f["label"] == 0)
-            mice_durs = [f["dur"] for f in flow_records if f["label"] == 0]
+            active_elephant = sum(1 for f in flow_records if f["sbytes"] >= self.s_threshold_bytes)
+            active_mice = sum(1 for f in flow_records if f["sbytes"] < self.s_threshold_bytes)
+            mice_durs = [f["dur"] for f in flow_records if f["sbytes"] < self.s_threshold_bytes]
 
         # 1. Tổng thông lượng mạng (Mbps): Tổng thông lượng chuyển giao tại các chặng biên xuống host
         host_links = [l for l in link_records if l["link_type"] in ["Access-Host", "Core-Inet"]]

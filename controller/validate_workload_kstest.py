@@ -142,6 +142,10 @@ def main():
 
     # Biến toàn bộ bản ghi viễn trắc (để đối sánh In-flight Snapshots)
     trace_path = os.path.join(output_dir, "traffic_flow_dataset_with_paths.csv")
+    if not os.path.exists(trace_path):
+        cand_trace = os.path.join(RESULTS_DIR, "traffic_flow_dataset_with_paths.csv")
+        if os.path.exists(cand_trace):
+            trace_path = cand_trace
     df_trace = None
     if os.path.exists(trace_path) and os.path.abspath(trace_path) != os.path.abspath(dataset_path):
         try:

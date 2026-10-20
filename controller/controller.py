@@ -99,6 +99,8 @@ class MultiTierEcmpController(app_manager.RyuApp):
         self.installed_groups = set()     # Lưu tập hợp (dpid, group_id)
         self.installed_biflows = {}       # Lưu ánh xạ biflow_signature -> timestamp cài đặt (TTL 1.5s)
         self.packet_in_accounting = {}    # Bù byte/gói đầu tiên đi qua PacketOut: (dpid, s_ip, d_ip, s_pt, d_pt, proto) -> [bytes, pkts, ts]
+        self.pending_early_probes = {}    # dpid -> {biflow_sig: (t_start, src_ip, dst_ip, src_port, dst_port, proto)}
+        self.active_early_timers = set()  # Tập các dpid đang có hẹn giờ vi mô 8ms chờ bắn OFPFlowStatsRequest
 
         # Quản lý Debounce Timer chống bão FlowMod khi LLDP phát hiện link dồn dập
         self.topology_debounce_timer = None
@@ -351,6 +353,19 @@ class MultiTierEcmpController(app_manager.RyuApp):
                     # Cài đặt cặp Flow Rule 5-tuple đối xứng tại Table 0 trên CẢ Egress và Ingress Switch
                     self.install_symmetric_biflow(datapath, dpid, src_ip, dst_ip, src_port, dst_port, proto)
 
+                    # Đăng ký truy vấn sớm Sub-10ms (8ms kể từ khi luồng xuất hiện) trên Ingress Switch
+                    sw_probes = self.pending_early_probes.setdefault(dpid, {})
+                    if len(sw_probes) > 5000:
+                        cutoff_p = now_ts - 10.0
+                        self.pending_early_probes[dpid] = {
+                            k: v for k, v in sw_probes.items() if v[0] >= cutoff_p
+                        }
+                        sw_probes = self.pending_early_probes[dpid]
+                    sw_probes[biflow_signature] = (now_ts, src_ip, dst_ip, src_port, dst_port, proto)
+                    if dpid not in self.active_early_timers:
+                        self.active_early_timers.add(dpid)
+                        hub.spawn_after(0.008, self._fire_early_probe, datapath, dpid)
+
             # Chuyển tiếp gói tin đầu tiên (TCP SYN / UDP Pkt #1) ngay sau khi FlowMod Priority 150 đã được nạp
             if dst_ip in self.host_db:
                 target_dpid = self.host_db[dst_ip]["dpid"]
@@ -484,10 +499,14 @@ class MultiTierEcmpController(app_manager.RyuApp):
         else:
             true_dur = max(dur_raw, 0.001)
 
-        # Giải phóng cache installed_biflows ngay khi luồng kết thúc và bù byte gói đầu tiên đi qua PacketOut
+        # Giải phóng cache installed_biflows & pending_early_probes ngay khi luồng kết thúc
         if s_pt > 0 and d_pt > 0:
             biflow_sig = tuple(sorted([(s_ip, s_pt), (d_ip, d_pt)])) + (proto,)
             self.installed_biflows.pop(biflow_sig, None)
+            # Nếu luồng cực ngắn chưa kịp bắn early probe thì phát luôn hoặc dọn dẹp
+            sw_probes = self.pending_early_probes.get(dpid)
+            if sw_probes:
+                sw_probes.pop(biflow_sig, None)
 
         acct_key = (dpid, s_ip, d_ip, s_pt, d_pt, proto)
         pi_bytes, pi_pkts, _ = self.packet_in_accounting.pop(acct_key, (0, 0, 0.0))
@@ -519,6 +538,124 @@ class MultiTierEcmpController(app_manager.RyuApp):
         except Exception:
             # Drop oldest nếu queue chạm ngưỡng maxsize=50000 bảo vệ bộ nhớ
             pass
+
+    def _fire_early_probe(self, datapath, dpid):
+        """
+        Kích hoạt truy vấn bộ đếm phần cứng OVS ở mốc ~8ms (< 10ms) kể từ khi luồng xuất hiện.
+        Gom nhóm (Coalescing) toàn bộ luồng mới trên cùng một Ingress Switch thành 1 bản tin OFPFlowStatsRequest(table_id=0) duy nhất.
+        """
+        self.active_early_timers.discard(dpid)
+        sw_probes = self.pending_early_probes.get(dpid)
+        if not sw_probes:
+            return
+        try:
+            parser = datapath.ofproto_parser
+            req = parser.OFPFlowStatsRequest(datapath, flags=0, table_id=0)
+            datapath.send_msg(req)
+        except Exception:
+            pass
+
+    @set_ev_cls(ofp_event.EventOFPFlowStatsReply, MAIN_DISPATCHER)
+    def early_flow_stats_reply_handler(self, ev):
+        """
+        Đón bản tin phản hồi OFPFlowStatsReply từ Ingress Switch ở mốc < 10ms.
+        Ghép cặp bộ đếm phần cứng 2 chiều + bù gói đầu tiên từ packet_in_accounting và đẩy qua kênh IPC.
+        """
+        msg = ev.msg
+        dp = msg.datapath
+        dpid = dp.id
+        sw_probes = self.pending_early_probes.get(dpid)
+        if not sw_probes:
+            return
+
+        now_ts = time.time()
+        # Chỉ trích xuất các luồng đã đủ độ tuổi quan sát sớm (>= 5ms)
+        ready_sigs = [sig for sig, info in list(sw_probes.items()) if (now_ts - info[0]) >= 0.005]
+        if not ready_sigs:
+            # Nếu vẫn còn luồng chưa đủ 5ms (do trùng nhịp poll khác), hẹn lại sau 5ms
+            if dpid not in self.active_early_timers and sw_probes:
+                self.active_early_timers.add(dpid)
+                hub.spawn_after(0.005, self._fire_early_probe, dp, dpid)
+            return
+
+        # Lập chỉ mục nhanh các luật 5-tuple Table 0 trong bản tin phản hồi
+        stats_map = {}
+        for stat in msg.body:
+            if getattr(stat, "table_id", 0) != 0 or getattr(stat, "priority", 0) < 150:
+                continue
+            m = stat.match
+            s_ip = m.get("ipv4_src") or m.get("nw_src")
+            d_ip = m.get("ipv4_dst") or m.get("nw_dst")
+            if not (s_ip and d_ip):
+                continue
+            proto = int(m.get("ip_proto") or m.get("nw_proto") or 0)
+            s_pt = int(m.get("tcp_src") or m.get("udp_src") or m.get("tp_src") or 0)
+            d_pt = int(m.get("tcp_dst") or m.get("udp_dst") or m.get("tp_dst") or 0)
+            if s_pt > 0 and d_pt > 0:
+                dur_ovs = float(stat.duration_sec) + float(stat.duration_nsec) / 1e9
+                stats_map[(s_ip, d_ip, s_pt, d_pt, proto)] = (
+                    int(stat.byte_count), int(stat.packet_count), dur_ovs
+                )
+
+        now_str_us = datetime.fromtimestamp(now_ts).strftime("%Y-%m-%d %H:%M:%S.%f")
+        for sig in ready_sigs:
+            probe_info = sw_probes.pop(sig, None)
+            if not probe_info:
+                continue
+            t_start, src_ip, dst_ip, src_port, dst_port, proto = probe_info
+
+            fwd_b, fwd_p, fwd_dur = stats_map.get((src_ip, dst_ip, src_port, dst_port, proto), (0, 0, 0.0))
+            bwd_b, bwd_p, bwd_dur = stats_map.get((dst_ip, src_ip, dst_port, src_port, proto), (0, 0, 0.0))
+
+            # Đọc cộng bù gói đầu tiên đi qua PacketOut (KHÔNG pop để FlowRemoved cuối đời vẫn cộng đủ)
+            pi_fwd = self.packet_in_accounting.get((dpid, src_ip, dst_ip, src_port, dst_port, proto), (0, 0, 0.0))
+            pi_bwd = self.packet_in_accounting.get((dpid, dst_ip, src_ip, dst_port, src_port, proto), (0, 0, 0.0))
+
+            sbytes = int(fwd_b) + int(pi_fwd[0])
+            Spkts = int(fwd_p) + int(pi_fwd[1])
+            dbytes = int(bwd_b) + int(pi_bwd[0])
+            Dpkts = int(bwd_p) + int(pi_bwd[1])
+
+            if sbytes == 0 and dbytes == 0:
+                continue
+
+            # Đồng bộ hướng luồng (Forward là chiều có dung lượng lớn hơn) khớp 100% với BiFlowStitcher
+            if dbytes > sbytes:
+                src_ip, dst_ip = dst_ip, src_ip
+                src_port, dst_port = dst_port, src_port
+                sbytes, dbytes = dbytes, sbytes
+                Spkts, Dpkts = Dpkts, Spkts
+
+            # Thời gian quan sát thực tế tại cửa sổ sớm (< 10ms)
+            elapsed = max(now_ts - t_start, fwd_dur, bwd_dur, 0.001)
+            dur_early = min(elapsed, 0.0099) if (now_ts - t_start) < 0.015 else elapsed
+
+            early_rec = {
+                "type": "EARLY_FLOW_STATS",
+                "dpid": dpid,
+                "src_ip": src_ip,
+                "dst_ip": dst_ip,
+                "src_port": src_port,
+                "dst_port": dst_port,
+                "proto": proto,
+                "sbytes": sbytes,
+                "dbytes": dbytes,
+                "Spkts": Spkts,
+                "Dpkts": Dpkts,
+                "dur": round(dur_early, 6),
+                "timestamp": now_ts,
+                "timestamp_str": now_str_us,
+                "timestamp_epoch_ms": int(now_ts * 1000)
+            }
+            try:
+                self.telemetry_queue.put_nowait(early_rec)
+            except Exception:
+                pass
+
+        # Nếu vẫn còn luồng mới vào sau trong sw_probes, đặt hẹn giờ tiếp
+        if sw_probes and dpid not in self.active_early_timers:
+            self.active_early_timers.add(dpid)
+            hub.spawn_after(0.006, self._fire_early_probe, dp, dpid)
 
     def _ipc_server_loop(self):
         """

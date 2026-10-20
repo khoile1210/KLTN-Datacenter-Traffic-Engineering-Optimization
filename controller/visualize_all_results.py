@@ -8,6 +8,7 @@ Mô tả   : Sinh toàn bộ hệ thống biểu đồ trực quan hóa dữ li�
           4. 04_network_evaluation_kpis.png (Active flows time series, Throughput, Jain's fairness index)
           5. 05_microburst_ground_truth.png (Microburst duration, bytes, rate distribution)
           Tất cả biểu đồ và báo cáo tóm tắt được lưu vào thư mục timestamp: results/<YYYY-MM-DD_HH-MM>/
+          python controller/visualize_all_results.py
 """
 
 import os
@@ -37,16 +38,10 @@ RESULTS_DIR = os.path.join(BASE_DIR, "results")
 if cli_args.output_dir:
     TARGET_DIR = cli_args.output_dir
 else:
-    subdirs = [
-        os.path.join(RESULTS_DIR, d) for d in os.listdir(RESULTS_DIR)
-        if os.path.isdir(os.path.join(RESULTS_DIR, d)) and not d.startswith('.')
-        and d not in ('Excel', 'digitization_verification')
-    ]
-    if subdirs:
-        subdirs.sort(key=os.path.getmtime, reverse=True)
-        TARGET_DIR = subdirs[0]
-    else:
-        NOW_STR = datetime.now().strftime("%Y-%m-%d_%H-%M")
+    NOW_STR = datetime.now().strftime("%Y-%m-%d_%H-%M")
+    TARGET_DIR = os.path.join(RESULTS_DIR, NOW_STR)
+    if os.path.exists(TARGET_DIR):
+        NOW_STR = datetime.now().strftime("%Y-%m-%d_%H-%M_%S")
         TARGET_DIR = os.path.join(RESULTS_DIR, NOW_STR)
 
 os.makedirs(TARGET_DIR, exist_ok=True)
@@ -56,6 +51,26 @@ sns.set_theme(style="whitegrid", font="sans-serif")
 plt.rcParams['font.sans-serif'] = ['DejaVu Sans', 'Arial', 'Helvetica']
 plt.rcParams['axes.edgecolor'] = '#bdc3c7'
 plt.rcParams['axes.linewidth'] = 0.8
+
+
+def move_csv_files_to_target():
+    """Di chuyển toàn bộ các file CSV từ thư mục gốc results/ vào TARGET_DIR."""
+    import shutil
+    moved_files = []
+    if not os.path.exists(RESULTS_DIR):
+        return moved_files
+    for fname in os.listdir(RESULTS_DIR):
+        src_path = os.path.join(RESULTS_DIR, fname)
+        if os.path.isfile(src_path) and fname.lower().endswith(".csv"):
+            dst_path = os.path.join(TARGET_DIR, fname)
+            if os.path.abspath(src_path) != os.path.abspath(dst_path):
+                shutil.move(src_path, dst_path)
+                moved_files.append(fname)
+    if moved_files:
+        print(f"[*] Đã di chuyển {len(moved_files)} tệp CSV từ results/ vào {TARGET_DIR}:")
+        for f in moved_files:
+            print(f"    [->] {f}")
+    return moved_files
 
 
 def resolve_csv_path(filename):
@@ -75,6 +90,8 @@ def resolve_csv_path(filename):
     if subdirs:
         subdirs.sort(key=os.path.getmtime, reverse=True)
         for s in subdirs:
+            if os.path.abspath(s) == os.path.abspath(TARGET_DIR):
+                continue
             candidate = os.path.join(s, filename)
             if os.path.exists(candidate):
                 return candidate
@@ -512,6 +529,9 @@ def main():
     print(f" Thư mục đích: {TARGET_DIR}")
     print("=" * 80)
     
+    # 1. Di chuyển toàn bộ các file CSV thô từ results/ vào TARGET_DIR
+    move_csv_files_to_target()
+
     plot_traffic_flows()
     plot_device_resources()
     plot_link_utilization()
@@ -527,8 +547,11 @@ def main():
 
     create_summary_report()
     
+    # Quét lại lần cuối nếu có file CSV mới phát sinh trong quá trình chạy
+    move_csv_files_to_target()
+
     print("\n[V] Hoàn tất toàn bộ biểu đồ trực quan hóa dữ liệu thực nghiệm!")
-    print(f"[*] Đường dẫn thư mục: {TARGET_DIR}\n")
+    print(f"[*] Toàn bộ kết quả và tệp CSV đã được lưu tại: {TARGET_DIR}\n")
     return TARGET_DIR
 
 
