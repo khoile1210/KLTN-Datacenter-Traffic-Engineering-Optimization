@@ -1,0 +1,3 @@
+﻿source,n,dur_le_10ms,packets_le_10,exceeds_both
+early_probe_extended,1605,0,0,1605
+early_probe_sub10ms,14065,3685,13977,0

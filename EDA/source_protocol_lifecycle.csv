@@ -1,0 +1,9 @@
+﻿source,protocol,duration_source,completed,rows
+early_probe_extended,6,hardware_early_probe,0,871
+early_probe_extended,17,hardware_early_probe,0,734
+early_probe_sub10ms,6,hardware_early_probe,0,11990
+early_probe_sub10ms,17,hardware_early_probe,0,2075
+flow_removed_push,6,hardware_flow_removed,1,12861
+flow_removed_push_unilateral,17,hardware_flow_removed,1,2809
+polling_snapshot,6,ovs_active_duration,0,7549
+polling_snapshot,17,ovs_active_duration,0,8

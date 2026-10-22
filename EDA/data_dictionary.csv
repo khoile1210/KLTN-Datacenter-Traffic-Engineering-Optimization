@@ -1,0 +1,30 @@
+﻿column,dtype,meaning,unit,formula_source,role,observable
+timestamp,string,thời điểm record dạng chữ,calendar; timezone chưa biết,collector/event,metadata,metadata theo record; nhãn proxy chỉ có sau removal
+flow_instance_id,string,khóa instance trong artifact,string,producer CSV chưa xác minh,join/group,metadata theo record; nhãn proxy chỉ có sau removal
+src_ip,string,địa chỉ chiều forward,IPv4,tuple,metadata,metadata theo record; nhãn proxy chỉ có sau removal
+dst_ip,string,địa chỉ chiều reverse,IPv4,tuple,metadata,metadata theo record; nhãn proxy chỉ có sau removal
+src_port,integer,port phía source,port,tuple,metadata,metadata theo record; nhãn proxy chỉ có sau removal
+dst_port,integer,port phía destination,port,tuple,metadata,metadata theo record; nhãn proxy chỉ có sau removal
+protocol,integer,"IP protocol (6 TCP, 17 UDP)",category,tuple,context; hằng ở TCP cohort,metadata theo record; nhãn proxy chỉ có sau removal
+dur,float,duration theo nguồn,s,collector/controller; không xác nhận FCT,early feature có điều kiện timing,tại early nếu lấy early record; removal/poll chỉ để audit
+sbytes,integer,bytes chiều forward tích lũy,B,counters,early feature; removal tạo proxy,tại early nếu lấy early record; removal/poll chỉ để audit
+dbytes,integer,bytes chiều reverse tích lũy,B,counters,early feature,tại early nếu lấy early record; removal/poll chỉ để audit
+Spkts,integer,"packets forward, có thể đã hiệu chỉnh",packet,counters/correction,early feature,tại early nếu lấy early record; removal/poll chỉ để audit
+Dpkts,integer,"packets reverse, có thể đã hiệu chỉnh",packet,counters/correction,early feature,tại early nếu lấy early record; removal/poll chỉ để audit
+Sload,float,tốc độ forward dẫn xuất,B/s,"sbytes/max(dur,1e-6)",early feature có điều kiện timing,tại early nếu lấy early record; removal/poll chỉ để audit
+Dload,float,tốc độ reverse dẫn xuất,B/s,"dbytes/max(dur,1e-6)",early feature có điều kiện timing,tại early nếu lấy early record; removal/poll chỉ để audit
+smeansz,float,bytes/packet forward,B/packet,"sbytes/max(Spkts,1)",early feature dẫn xuất,tại early nếu lấy early record; removal/poll chỉ để audit
+dmeansz,float,bytes/packet reverse,B/packet,"dbytes/max(Dpkts,1)",early feature dẫn xuất,tại early nếu lấy early record; removal/poll chỉ để audit
+Ratio,float,"tỷ số bytes, epsilon khi reverse zero",ratio,sbytes/(dbytes+1e-6),early feature dẫn xuất,tại early nếu lấy early record; removal/poll chỉ để audit
+hop_count,integer,số hop theo path suy luận,hop,trace_full_path/rules,context metadata,metadata theo record; nhãn proxy chỉ có sau removal
+path,string,path suy ra từ rule/group,string,trace_full_path; không là packet trace,metadata,metadata theo record; nhãn proxy chỉ có sau removal
+label,integer,nhãn gốc; -1 chưa gán,category,collector giữ -1,raw target; không tự sửa,metadata theo record; nhãn proxy chỉ có sau removal
+src_host,string,host source suy từ IP,category,mapping topology,metadata/bootstrap cluster,metadata theo record; nhãn proxy chỉ có sau removal
+dst_host,string,host destination suy từ IP,category,mapping topology,metadata,metadata theo record; nhãn proxy chỉ có sau removal
+locality,string,vị trí tương đối hai host,category,topology mapping,metadata/cohort,metadata theo record; nhãn proxy chỉ có sau removal
+pkt_rate,float,tốc độ packet hai chiều,packet/s,"(Spkts+Dpkts)/max(dur,1e-6)",early feature dẫn xuất,tại early nếu lấy early record; removal/poll chỉ để audit
+byte_rate,float,tốc độ byte hai chiều,B/s,"(sbytes+dbytes)/max(dur,1e-6)",early feature dẫn xuất,tại early nếu lấy early record; removal/poll chỉ để audit
+timestamp_epoch_ms,integer,mốc thời gian record,ms,producer CSV,metadata/order,metadata theo record; nhãn proxy chỉ có sau removal
+record_source,string,nguồn/pha record,category,early/polling/removal,metadata/cohort,metadata theo record; nhãn proxy chỉ có sau removal
+duration_source,string,nguồn duration,category,collector provenance,quality metadata,metadata theo record; nhãn proxy chỉ có sau removal
+is_completed,integer,cờ removal/completed của collector,0/1,không xác nhận receiver completion,lifecycle metadata,metadata theo record; nhãn proxy chỉ có sau removal

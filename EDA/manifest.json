@@ -1,0 +1,19 @@
+{
+  "input_name": "traffic_flow_dataset_with_paths (2).csv",
+  "input_sha256": "b26060e9f274c386681754d1204ace7e3dbb8303458679a3c10be3e47674ad4f",
+  "raw_rows": 38897,
+  "paired_ids": 15670,
+  "cohort": "tcp_east_west_sub10ms",
+  "cohort_n": 9787,
+  "target": "forward_65536B_removal_proxy",
+  "positive": 1526,
+  "seed": 42,
+  "bootstrap_repeats": 200,
+  "bootstrap_cluster": "src_host",
+  "plotted_sample": 2500,
+  "python": "3.13.15",
+  "numpy": "2.1.3",
+  "scipy": "1.16.3",
+  "matplotlib": "3.10.0",
+  "status": "descriptive_only; producer/cutoff/application_completion unverified"
+}

@@ -1,0 +1,6 @@
+﻿source,rows,row_pct
+early_probe_extended,1605,4.1262822325629225
+early_probe_sub10ms,14065,36.15960099750623
+flow_removed_push,12861,33.06424659999486
+flow_removed_push_unilateral,2809,7.221636630074299
+polling_snapshot,7557,19.428233539861687

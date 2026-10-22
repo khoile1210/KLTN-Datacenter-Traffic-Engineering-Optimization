@@ -1,0 +1,9 @@
+﻿stratum,category,pairs,positive_pct,median_early_sbytes
+record_source,early_probe_extended,1605,52.834890965732086,27398.0
+record_source,early_probe_sub10ms,14065,13.693565588339851,74.0
+protocol,17,2809,18.049127803488783,1616.0
+protocol,6,12861,17.62693414197963,74.0
+locality,Extra-DC,2872,18.97632311977716,140.0
+locality,Intra-Cluster,8938,17.073170731707318,140.0
+locality,Intra-DC,1873,17.565403096636413,74.0
+locality,Intra-Rack,1987,18.822345244086563,597.0

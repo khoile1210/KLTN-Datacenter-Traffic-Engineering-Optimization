@@ -1,0 +1,13 @@
+﻿group,category,n,first,second,spearman
+locality,Intra-Cluster,6875,sbytes,Spkts,0.9873380836792495
+locality,Intra-Cluster,6875,sbytes,dur,0.3707607671993791
+locality,Intra-Cluster,6875,Sload,byte_rate,0.9668003183574511
+locality,Intra-DC,1512,sbytes,Spkts,0.9969606106064663
+locality,Intra-DC,1512,sbytes,dur,0.4161718147610229
+locality,Intra-DC,1512,Sload,byte_rate,0.9692829398605693
+locality,Intra-Rack,1400,sbytes,Spkts,0.9626942395983872
+locality,Intra-Rack,1400,sbytes,dur,0.17443273329291598
+locality,Intra-Rack,1400,Sload,byte_rate,0.9875920593124026
+protocol,6,9787,sbytes,Spkts,0.9866847310417742
+protocol,6,9787,sbytes,dur,0.34288027588837794
+protocol,6,9787,Sload,byte_rate,0.9713985534754856

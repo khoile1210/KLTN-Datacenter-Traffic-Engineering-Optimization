@@ -1,0 +1,6 @@
+﻿column,value
+protocol,6
+label,-1
+record_source,early_probe_sub10ms
+duration_source,hardware_early_probe
+is_completed,0
